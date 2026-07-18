@@ -1,0 +1,115 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+}
+
+.game-canvas {
+  display: block;
+  position: fixed;
+  inset: 0;
+  image-rendering: pixelated;
+}
+
+.command-bar {
+  position: fixed;
+  top: 40px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  background: rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(16px) saturate(1.5);
+  -webkit-backdrop-filter: blur(16px) saturate(1.5);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 18px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  z-index: 10;
+}
+
+.command-bar input {
+  width: 440px;
+  padding: 10px 14px;
+  border: none;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.35);
+  color: #17220f;
+  font-size: 15px;
+  outline: none;
+}
+
+.command-bar input::placeholder {
+  color: rgba(23, 34, 15, 0.45);
+}
+
+.command-bar button {
+  padding: 8px 14px;
+  border: none;
+  border-radius: 12px;
+  background: rgba(139, 216, 78, 0.75);
+  color: #1c2b12;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.command-bar button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.command-bar button.undo {
+  background: rgba(255, 255, 255, 0.3);
+  color: #17220f;
+  font-size: 16px;
+  padding: 8px 12px;
+}
+
+.toast {
+  position: fixed;
+  top: 104px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 16px;
+  background: rgba(20, 24, 18, 0.55);
+  backdrop-filter: blur(16px) saturate(1.5);
+  -webkit-backdrop-filter: blur(16px) saturate(1.5);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: #f2f6ec;
+  border-radius: 999px;
+  font-size: 13px;
+  z-index: 10;
+  animation: toast-in 180ms ease-out;
+  pointer-events: none;
+  max-width: 70vw;
+  text-align: center;
+}
+
+.toast-detail {
+  font-size: 11px;
+  font-family: monospace;
+  opacity: 0.85;
+  word-break: break-all;
+  max-height: 96px;
+  overflow: hidden;
+  margin-top: 6px;
+  text-align: left;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
