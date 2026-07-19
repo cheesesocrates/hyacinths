@@ -4,11 +4,13 @@ import idleUrl from '../../assets/everything.png';
 import walkUrl from '../../assets/everything_walks.png';
 import waterUrl from '../../assets/everything_water.png';
 
-// Every PNG in nature_pack loads automatically and groups by base name with
-// trailing digits stripped, so "acacia.png", "acacia1.png", "acacia2.png"
-// all become variants of "acacia". Drop in a new numbered file for a biome
-// and it's picked up on the next build/reload — no code changes needed.
-const natureModules = import.meta.glob('../../assets/nature_pack/*.png', { eager: true, import: 'default' });
+// Every PNG anywhere under nature_pack loads automatically (per-biome
+// subfolders like nature_pack/desert/ are fine — only the filename matters)
+// and groups by base name with trailing digits stripped, so "acacia.png",
+// "acacia1.png", "acacia2.png" all become variants of "acacia". Drop in a
+// new numbered file and it's picked up on the next build/reload — no code
+// changes needed.
+const natureModules = import.meta.glob('../../assets/nature_pack/**/*.png', { eager: true, import: 'default' });
 
 function loadImage(src) {
   return new Promise((resolve, reject) => {
