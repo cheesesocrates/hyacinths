@@ -11,7 +11,7 @@ const API_KEY = process.env.GEMINI_API_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 
-const TERRAINS = new Set(['grass', 'desert', 'forest', 'river', 'lake']);
+const TERRAINS = new Set(['grass', 'desert', 'forest', 'river', 'lake', 'tundra', 'ocean', 'savannah', 'mountain']);
 
 const INVALID = (notification = 'I cannot create that environment yet.') => ({
   notification,
@@ -165,7 +165,8 @@ function sanitize(raw, charX, charY) {
       .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
       .slice(0, 12);
     if (points.length < 2) return INVALID(notification);
-    const connect = ed.connect === false ? false : true;
+    const connect = ed.connect === false ? false : ed.connect === true ? true : 'ask';
+    const overwrite = ed.overwrite === false ? false : true;
     const width = Math.min(5, Math.max(0.4, num(ed.width, 1)));
     return { notification, engine_data: { terrain, points, overwrite, connect, width } };
   }
@@ -181,6 +182,21 @@ function sanitize(raw, charX, charY) {
         seed: num(ed.seed, Math.random() * 1000),
         roughness: Math.min(0.8, Math.max(0.3, num(ed.roughness, 0.55))),
         atRiverEnd: ed.atRiverEnd === true,
+        overwrite
+      }
+    };
+  }
+
+  if (terrain === 'ocean') {
+    return {
+      notification,
+      engine_data: {
+        terrain,
+        centerX: Math.round(num(ed.centerX, charX)),
+        centerY: Math.round(num(ed.centerY, charY)),
+        maxRadius: Math.min(70, Math.max(20, num(ed.maxRadius, 38))),
+        seed: num(ed.seed, Math.random() * 1000),
+        roughness: Math.min(0.8, Math.max(0.3, num(ed.roughness, 0.55))),
         overwrite
       }
     };
@@ -215,14 +231,18 @@ function detectDirection(text) {
 }
 
 // Decides whether a river should auto-join nearby existing rivers, mirroring
-// the RIVER CONNECTIVITY directive given to the LLM providers. Defaults true.
-function detectConnect(text) {
+// the RIVER CONNECTIVITY directive given to the LLM providers. Three states:
+// false when the player explicitly wants a separate/disconnected river, true
+// when the player explicitly asks to connect/join/merge, and 'ask' otherwise
+// (the client UI will prompt the player when it did not say either way).
+function detectConnectState(text) {
   if (/\b(separate|disconnected|standalone)\b/.test(text) || /\bits own\b/.test(text)) return false;
   const negNearConnect =
     /\b(not|don't|dont)\b(?:\s+\S+){0,3}\s+connect/i.test(text) ||
     /connect(?:\s+\S+){0,3}\s+\b(not|don't|dont)\b/i.test(text);
   if (negNearConnect) return false;
-  return true;
+  if (/\b(connect|join|merge|link)\b/.test(text)) return true;
+  return 'ask';
 }
 
 // Keyword parser used when no API key is configured or every provider is
@@ -235,7 +255,11 @@ function offlineFallback(command, charX, charY, apiFailed, debug) {
     desert: ['desert', 'sand', 'dune'],
     forest: ['forest', 'tree', 'woods', 'jungle'],
     river: ['river', 'water', 'stream', 'creek'],
-    lake: ['lake', 'pond', 'lagoon']
+    lake: ['lake', 'pond', 'lagoon'],
+    tundra: ['tundra', 'snow', 'arctic', 'frozen', 'winter', 'ice'],
+    ocean: ['ocean', 'sea'],
+    savannah: ['savannah', 'savanna', 'acacia'],
+    mountain: ['mountain', 'mountains', 'rocky', 'peak', 'cliff']
   };
   let terrain = null;
   let bestIdx = -1;
@@ -280,13 +304,17 @@ function offlineFallback(command, charX, charY, apiFailed, debug) {
           p.y += dir.dy * 20;
         }
       }
-      const connect = detectConnect(text);
+      const connect = detectConnectState(text);
+      const riverOverwrite = /(don'?t|do not|no|without|avoid)[^.]*overwrit/.test(text) ||
+        /\boverwrit\w*\b[^.]*\b(not|no)\b/.test(text)
+        ? false
+        : true;
       let width = 1;
       if (/\b(wide|broad|big|huge|thick)\b/.test(text)) width = 2;
       else if (/\b(thin|narrow|small|tiny)\b/.test(text)) width = 0.6;
       result = {
         notification: 'Carving a winding river path.' + suffix,
-        engine_data: { terrain, points, overwrite, connect, width }
+        engine_data: { terrain, points, overwrite: riverOverwrite, connect, width }
       };
     } else if (terrain === 'lake') {
       let centerX = charX;
@@ -308,6 +336,25 @@ function offlineFallback(command, charX, charY, apiFailed, debug) {
           seed: Math.random() * 1000,
           roughness: 0.4 + Math.random() * 0.3,
           atRiverEnd,
+          overwrite
+        }
+      };
+    } else if (terrain === 'ocean') {
+      let centerX = charX;
+      let centerY = charY;
+      if (dir) {
+        centerX += dir.dx * 25;
+        centerY += dir.dy * 25;
+      }
+      result = {
+        notification: 'Spreading a vast ocean here.' + suffix,
+        engine_data: {
+          terrain,
+          centerX,
+          centerY,
+          maxRadius: 38,
+          seed: Math.random() * 1000,
+          roughness: 0.4 + Math.random() * 0.3,
           overwrite
         }
       };

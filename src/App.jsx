@@ -10,6 +10,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [shaping, setShaping] = useState(false);
   const [toast, setToast] = useState(null);
+  // Questions the player must answer before terrain applies:
+  // { data, steps: ['connect'?, 'overwrite'?] } — answered front to back.
+  const [pending, setPending] = useState(null);
 
   const showToast = (text, detail) => {
     clearTimeout(toastTimer.current);
@@ -34,12 +37,66 @@ export default function App() {
     clearInterval(settleTimer.current);
   }, []);
 
-  const locked = busy || shaping;
+  const locked = busy || shaping || !!pending;
+
+  const applyNow = (data) => {
+    if (gameRef.current.applyEngineData(data)) watchUntilIdle();
+  };
+
+  // Answer the current question. "connect" no just means a separate river
+  // and moves on; "overwrite" no cancels the whole generation.
+  const answer = (yes) => {
+    if (!pending) return;
+    const [step, ...rest] = pending.steps;
+    const data = { ...pending.data };
+    if (step === 'connect') {
+      data.connect = yes;
+      if (rest.length) {
+        setPending({ data, steps: rest });
+        return;
+      }
+      setPending(null);
+      applyNow(data);
+      return;
+    }
+    // overwrite question
+    setPending(null);
+    if (yes) {
+      applyNow(data);
+    } else {
+      showToast('Cancelled — nothing was overwritten.');
+    }
+  };
+
+  // While a question popup is open: Enter agrees, Backspace/Delete (or the
+  // no button) declines.
+  useEffect(() => {
+    if (!pending) return undefined;
+    const onKey = (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        answer(true);
+      } else if (e.key === 'Backspace' || e.key === 'Delete') {
+        e.preventDefault();
+        answer(false);
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [pending]);
 
   const submit = async (e) => {
     e.preventDefault();
-    const text = command.trim();
-    if (!text || locked) return;
+    const raw = command.trim();
+    if (!raw || locked) return;
+    // "/overwrite" anywhere in the message forces the new terrain to replace
+    // whatever already exists. It's stripped before the prompt reaches the AI.
+    const forceOverwrite = /(^|\s)\/overwrite(\s|$)/i.test(raw);
+    const text = raw.replace(/(^|\s)\/overwrite(\s|$)/gi, ' ').replace(/\s+/g, ' ').trim();
+    if (!text) {
+      showToast('Add what to create, e.g. "/overwrite forest".');
+      return;
+    }
     const { x, y } = gameRef.current.getCharTile();
     setBusy(true);
     try {
@@ -50,8 +107,29 @@ export default function App() {
       });
       const data = await res.json();
       if (data.debug) console.error('[terrain api]', data.debug);
-      if (data.engine_data && gameRef.current.applyEngineData(data.engine_data)) watchUntilIdle();
-      showToast(data.notification || 'The land shifts quietly.', data.debug);
+      const ed = data.engine_data;
+      if (forceOverwrite && ed) ed.overwrite = true;
+      const note = data.notification || 'The land shifts quietly.';
+      if (!ed || !ed.terrain) {
+        showToast(note, data.debug);
+        setCommand('');
+        return;
+      }
+      // Build the question chain: rivers with an unspecified "connect" ask
+      // about joining nearby water first; any overwrite the player didn't
+      // force with /overwrite asks before anything is destroyed.
+      const steps = [];
+      if (ed.terrain === 'river' && ed.connect === 'ask') {
+        if (gameRef.current.hasRiverNear(ed.points)) steps.push('connect');
+        else ed.connect = true; // nothing nearby — moot either way
+      }
+      if (ed.overwrite && !forceOverwrite) steps.push('overwrite');
+      showToast(forceOverwrite ? note + ' (overwriting)' : note, data.debug);
+      if (steps.length) {
+        setPending({ data: ed, steps });
+      } else {
+        if (gameRef.current.applyEngineData(ed)) watchUntilIdle();
+      }
       setCommand('');
     } catch {
       showToast('Could not reach the terrain server.');
@@ -60,6 +138,8 @@ export default function App() {
       inputRef.current?.blur();
     }
   };
+
+  const zoom = (factor) => gameRef.current?.zoomBy(factor);
 
   const undo = () => {
     if (locked) return;
@@ -83,6 +163,21 @@ export default function App() {
           ↶
         </button>
       </form>
+      {pending && (
+        <div className="confirm-pop">
+          <span>{pending.steps[0] === 'connect' ? 'connect to nearby river?' : 'overwrite?'}</span>
+          <button type="button" className="yes" onClick={() => answer(true)} title="Yes (Enter)">
+            yes
+          </button>
+          <button type="button" className="no" onClick={() => answer(false)} title="No (Backspace)">
+            no
+          </button>
+        </div>
+      )}
+      <div className="zoom-bar">
+        <button type="button" onClick={() => zoom(1.2)} title="Zoom in (scroll up / +)">+</button>
+        <button type="button" onClick={() => zoom(1 / 1.2)} title="Zoom out (scroll down / -)">−</button>
+      </div>
       {toast && (
         <div className="toast">
           {toast.text}

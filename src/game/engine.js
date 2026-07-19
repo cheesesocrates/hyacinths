@@ -1,22 +1,48 @@
 export const TILE = 3; // fine terrain pixel size on screen
 export const SCALE = 5; // fine tiles per AI grid unit (the AI thinks in ~15px cells)
 
-export const TERRAIN = { VOID: 0, GRASS: 1, DESERT: 2, FOREST: 3, RIVER: 4 };
+export const TERRAIN = {
+  VOID: 0,
+  GRASS: 1,
+  DESERT: 2,
+  FOREST: 3,
+  RIVER: 4,
+  TUNDRA: 5,
+  ICE: 6,
+  OCEAN: 7,
+  SAVANNAH: 8,
+  MOUNTAIN: 9
+};
 
 export const TERRAIN_CODES = {
   grass: TERRAIN.GRASS,
   desert: TERRAIN.DESERT,
   forest: TERRAIN.FOREST,
   river: TERRAIN.RIVER,
-  lake: TERRAIN.RIVER // lakes are water — same tiles, blob-shaped
+  lake: TERRAIN.RIVER, // lakes are water — same tiles, blob-shaped
+  tundra: TERRAIN.TUNDRA,
+  ocean: TERRAIN.OCEAN,
+  savannah: TERRAIN.SAVANNAH,
+  mountain: TERRAIN.MOUNTAIN
 };
 
 export const COLORS = {
   [TERRAIN.GRASS]: '#8bd84e',
   [TERRAIN.DESERT]: '#f4e542',
   [TERRAIN.FOREST]: '#6b973f',
-  [TERRAIN.RIVER]: '#7b8fe4'
+  [TERRAIN.RIVER]: '#7b8fe4',
+  [TERRAIN.TUNDRA]: '#e8eff3',
+  [TERRAIN.ICE]: '#c9e8f5',
+  [TERRAIN.OCEAN]: '#7b8fe4', // all liquid water is one color; only ice differs
+  [TERRAIN.SAVANNAH]: '#d9c565',
+  [TERRAIN.MOUNTAIN]: null // grassy ground beneath the peaks — set from GRASS below
 };
+COLORS[TERRAIN.MOUNTAIN] = COLORS[TERRAIN.GRASS];
+
+// Liquid water (ice is frozen solid — walkable, not swimmable).
+const WATER = new Set([TERRAIN.RIVER, TERRAIN.OCEAN]);
+// Water and ice render flat and crisp — they never gradient-mix with land.
+const NO_BLEND = new Set([TERRAIN.RIVER, TERRAIN.OCEAN, TERRAIN.ICE]);
 
 const CHUNK = 64; // fine tiles per chunk side (192px canvases)
 const CHAR_DRAW = 96; // 16px sprite drawn at 6x
@@ -27,15 +53,26 @@ const WALK_FPS = 8;
 const WATER_FPS = 2;
 const IDLE_SPF = 1; // seconds per idle frame, per design
 const RIVER_RADIUS = 2.4; // fine tiles at width 1 — ~14px wide water
+const RIVER_EDGE_WAVE = 0.5; // fixed edge waviness (tiles); NOT scaled by width, so wide rivers stay clean
 const CONNECT_RANGE = 100; // fine tiles — max gap auto-bridged between rivers
 const HISTORY_LIMIT = 10;
 
-// Tree field: a jittered lattice keyed by world position, so trees are
-// deterministic, need no storage, and exist wherever forest tiles do.
-const TREE_CELL = 5; // lattice pitch in fine tiles (15px) — dense, leafy cover
-const TREE_DENSITY = 0.9; // fraction of lattice cells that host a tree
-const TREE_W = 30;
-const TREE_H = 30;
+const ZOOM_MIN = 0.35; // a good amount of zoom out — ~3x more world visible
+const ZOOM_MAX = 2.5;
+const ZOOM_DEFAULT = 1;
+
+// Decoration fields: jittered lattices keyed by world position, so sprites
+// are deterministic, need no storage, and exist wherever their biome does.
+// cell = lattice pitch in fine tiles, density = fraction of cells occupied,
+// w/h = draw size in world px. Forest stays dense and leafy; the others
+// are sparser set-dressing.
+const DECOR = {
+  [TERRAIN.FOREST]: { img: 'tree', cell: 5, density: 0.9, w: 30, h: 30 },
+  [TERRAIN.SAVANNAH]: { img: 'acacia', cell: 14, density: 0.2, w: 39, h: 36 },
+  [TERRAIN.DESERT]: { img: 'cactus', cell: 22, density: 0.06, w: 21, h: 27 },
+  [TERRAIN.MOUNTAIN]: { img: 'mountain', cell: 17, density: 0.28, w: 92, h: 88 },
+  [TERRAIN.TUNDRA]: { img: 'snowtree', cell: 12, density: 0.3, w: 27, h: 30 }
+};
 
 function fract(n) {
   return n - Math.floor(n);
@@ -146,10 +183,13 @@ export function riverTiles(points, radius = RIVER_RADIUS) {
       const p = catmullRom(pts[i], pts[i + 1], pts[i + 2], pts[i + 3], s / steps);
       if (prev) arc += Math.hypot(p.x - prev.x, p.y - prev.y);
       prev = p;
-      const rMax = radius + radius * 0.6 + 0.5;
+      const rMax = radius + RIVER_EDGE_WAVE + 1;
       for (let ty = Math.floor(p.y - rMax); ty <= Math.ceil(p.y + rMax); ty++) {
         for (let tx = Math.floor(p.x - rMax); tx <= Math.ceil(p.x + rMax); tx++) {
-          const r = radius + (hash(tx, ty, 7.3) - 0.3) * radius * 0.6;
+          // Smooth low-amplitude edge wave (fixed size, independent of
+          // river width) instead of per-tile spray, so banks read as clean
+          // water — especially on wide rivers.
+          const r = radius + (smoothNoise(tx * 0.12, ty * 0.12, 7.3) - 0.5) * 2 * RIVER_EDGE_WAVE;
           if (Math.hypot(tx - p.x, ty - p.y) > r) continue;
           const key = tx + ',' + ty;
           if (!cells.has(key)) cells.set(key, { x: tx, y: ty, d: arc });
@@ -165,6 +205,8 @@ export class Engine {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.images = images;
+    // Per-biome sprite variant pools, e.g. { acacia: [img, img, img] }.
+    this.decor = images.decor || {};
     this.keys = new Set();
     this.jobs = [];
     this.time = 0;
@@ -174,10 +216,19 @@ export class Engine {
     this.chunks = new Map();
     this.charX = 0;
     this.charY = 0;
+    this.zoom = ZOOM_DEFAULT;
     this.lastSolid = { x: 0, y: 0 };
     this.history = [];
     this.riverEndpoints = [];
     this.resize(window.innerWidth, window.innerHeight);
+  }
+
+  setZoom(z) {
+    this.zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z));
+  }
+
+  zoomBy(factor) {
+    this.setZoom(this.zoom * factor);
   }
 
   resize(w, h) {
@@ -238,7 +289,7 @@ export class Engine {
           continue;
         }
         const t = this.tileAt((originX + c) * SCALE + 2, (originY + r) * SCALE + 2);
-        row += '.GDFR'[t] || '.';
+        row += '.GDFRTIOSM'[t] || '.';
       }
       rows.push(row);
     }
@@ -254,14 +305,20 @@ export class Engine {
     const cy = Math.floor(ty / CHUNK);
     const chunk = this.chunkAt(cx, cy, true);
     let color = COLORS[code];
-    for (const o of BLEND_OFFSETS) {
-      const n = this.tileAt(tx + o.x, ty + o.y);
-      if (n !== TERRAIN.VOID && n !== code) {
-        const falloff = (1 - (o.d - 1) / 1.5) * 0.5;
-        const dither = 0.6 + 0.8 * hash(tx, ty, 3.7);
-        const f = Math.min(0.5, Math.max(0, falloff * dither));
-        color = blendColor(code, n, f);
-        break;
+    // Water and ice render as flat, crisp colors — no gradient mixing with
+    // land, which looked muddy at the banks.
+    if (!NO_BLEND.has(code)) {
+      for (const o of BLEND_OFFSETS) {
+        const n = this.tileAt(tx + o.x, ty + o.y);
+        // Skip void, water, and ice neighbors: only land biomes blend into
+        // each other, so land keeps a clean edge against water.
+        if (n !== TERRAIN.VOID && n !== code && !NO_BLEND.has(n)) {
+          const falloff = (1 - (o.d - 1) / 1.5) * 0.5;
+          const dither = 0.6 + 0.8 * hash(tx, ty, 3.7);
+          const f = Math.min(0.5, Math.max(0, falloff * dither));
+          color = blendColor(code, n, f);
+          break;
+        }
       }
     }
     chunk.ctx.fillStyle = color;
@@ -274,7 +331,12 @@ export class Engine {
     const chunk = this.chunkAt(cx, cy, true);
     const i = (ty - cy * CHUNK) * CHUNK + (tx - cx * CHUNK);
     const cur = chunk.grid[i];
-    if (!overwrite) {
+    // Tundra is cold: any liquid water it covers freezes to ice, no
+    // overwrite needed — that's the biome's nature.
+    let target = code;
+    if (code === TERRAIN.TUNDRA && WATER.has(cur)) {
+      target = TERRAIN.ICE;
+    } else if (!overwrite) {
       // Grass is the base layer: features may settle on empty ground or
       // grass, but never silently eat other features unless overwriting.
       if (code === TERRAIN.GRASS) {
@@ -283,8 +345,8 @@ export class Engine {
         return;
       }
     }
-    if (cur === code) return;
-    chunk.grid[i] = code;
+    if (cur === target) return;
+    chunk.grid[i] = target;
     this.paintCell(tx, ty);
     // Refresh neighbors so both sides of a border pick up the gradient.
     // When this tile REPLACED another biome, same-code neighbors may hold
@@ -294,7 +356,7 @@ export class Engine {
     for (const o of BLEND_OFFSETS) {
       const n = this.tileAt(tx + o.x, ty + o.y);
       if (n === TERRAIN.VOID) continue;
-      if (changedBiome || n !== code) this.paintCell(tx + o.x, ty + o.y);
+      if (changedBiome || n !== target) this.paintCell(tx + o.x, ty + o.y);
     }
   }
 
@@ -313,7 +375,7 @@ export class Engine {
         if (!chunk) continue;
         for (let ly = 0; ly < CHUNK; ly++) {
           for (let lx = 0; lx < CHUNK; lx++) {
-            if (chunk.grid[ly * CHUNK + lx] !== TERRAIN.RIVER) continue;
+            if (!WATER.has(chunk.grid[ly * CHUNK + lx])) continue;
             const d = Math.hypot(cx * CHUNK + lx - px, cy * CHUNK + ly - py);
             if (d < bestD) {
               bestD = d;
@@ -324,6 +386,20 @@ export class Engine {
       }
     }
     return best;
+  }
+
+  // True when either end of a proposed river path (AI coarse coords) is
+  // within auto-connect range of existing water — used by the UI to ask
+  // the player whether to join them.
+  hasRiverNear(points) {
+    const pts = (points || [])
+      .map((p) => ({ x: Number(p.x) * SCALE + SCALE / 2, y: Number(p.y) * SCALE + SCALE / 2 }))
+      .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+    if (pts.length < 2) return false;
+    const head = this.nearestRiverTile(pts[0].x, pts[0].y);
+    const tail = this.nearestRiverTile(pts[pts.length - 1].x, pts[pts.length - 1].y);
+    const pick = [head, tail].filter(Boolean).sort((a, b) => a.d - b.d)[0];
+    return !!(pick && pick.d > 2 && pick.d <= CONNECT_RANGE);
   }
 
   // Deep-copies world state so a prompt can be undone.
@@ -394,9 +470,10 @@ export class Engine {
     } else {
       const here = this.charTile();
       const isLake = data.terrain === 'lake';
+      const isOcean = data.terrain === 'ocean';
       const coarseX = Number.isFinite(Number(data.centerX)) ? Number(data.centerX) : here.x;
       const coarseY = Number.isFinite(Number(data.centerY)) ? Number(data.centerY) : here.y;
-      const coarseR = Math.min(80, Math.max(3, Number(data.maxRadius) || (isLake ? 12 : 40)));
+      const coarseR = Math.min(80, Math.max(3, Number(data.maxRadius) || (isLake ? 12 : isOcean ? 38 : 40)));
       const seed = Number.isFinite(Number(data.seed)) ? Number(data.seed) : Math.random() * 1000;
       const roughness = Math.min(0.8, Math.max(0.3, Number(data.roughness) || 0.55));
       let cx = coarseX * SCALE + SCALE / 2;
@@ -433,7 +510,7 @@ export class Engine {
   }
 
   inWater() {
-    return this.tileAt(Math.floor(this.charX / TILE), Math.floor(this.feetY() / TILE)) === TERRAIN.RIVER;
+    return WATER.has(this.tileAt(Math.floor(this.charX / TILE), Math.floor(this.feetY() / TILE)));
   }
 
   update(dt) {
@@ -481,97 +558,148 @@ export class Engine {
     this.jobs = this.jobs.filter((j) => j.idx < j.tiles.length);
   }
 
-  // Deterministic trees over forest tiles inside the viewport.
-  visibleTrees(camX, camY) {
-    const { canvas } = this;
-    const pitch = TREE_CELL * TILE;
-    const pad = TREE_H + 8;
-    const g0x = Math.floor((camX - pad) / pitch);
-    const g1x = Math.floor((camX + canvas.width + pad) / pitch);
-    const g0y = Math.floor((camY - pad) / pitch);
-    const g1y = Math.floor((camY + canvas.height + pad) / pitch);
-    const trees = [];
-    for (let gy = g0y; gy <= g1y; gy++) {
-      for (let gx = g0x; gx <= g1x; gx++) {
-        if (hash(gx, gy, 12.9) > TREE_DENSITY) continue;
-        const tx = gx * TREE_CELL + Math.floor(hash(gx, gy, 5.1) * TREE_CELL);
-        const ty = gy * TREE_CELL + Math.floor(hash(gx, gy, 9.7) * TREE_CELL);
-        if (this.tileAt(tx, ty) !== TERRAIN.FOREST) continue;
-        trees.push({ x: tx * TILE + TILE / 2, y: ty * TILE + TILE / 2 });
+  // Zoomed out, individual decor sprites would multiply (more world is
+  // visible) and shrink into speckle at the same time. Instead we thin the
+  // lattice out in steps as zoom drops — coarser spacing, bigger sprites —
+  // so a handful of large sprites read as "a batch of trees" from a
+  // distance; zooming back in walks back down through the same steps,
+  // filling in individual sprites again.
+  static decorLod(zoom) {
+    if (zoom >= 0.8) return 1;
+    if (zoom >= 0.55) return 2;
+    if (zoom >= 0.4) return 3;
+    return 4;
+  }
+
+  // Deterministic decoration sprites (trees, cacti, peaks, ...) over their
+  // biomes inside the viewport, collected across every DECOR lattice and
+  // depth-sorted together.
+  visibleDecor(camX, camY, viewW, viewH) {
+    const decor = [];
+    const lod = Engine.decorLod(this.zoom);
+    for (const codeKey of Object.keys(DECOR)) {
+      const codeNum = Number(codeKey);
+      const cfg = DECOR[codeKey];
+      const variants = this.decor[cfg.img];
+      if (!variants || !variants.length) continue;
+      const cell = cfg.cell * lod;
+      const w = cfg.w * lod;
+      const h = cfg.h * lod;
+      const pitch = cell * TILE;
+      const pad = Math.max(h, w) + 8;
+      const g0x = Math.floor((camX - pad) / pitch);
+      const g1x = Math.floor((camX + viewW + pad) / pitch);
+      const g0y = Math.floor((camY - pad) / pitch);
+      const g1y = Math.floor((camY + viewH + pad) / pitch);
+      for (let gy = g0y; gy <= g1y; gy++) {
+        for (let gx = g0x; gx <= g1x; gx++) {
+          if (hash(gx, gy, 12.9 + codeNum) > cfg.density) continue;
+          const tx = gx * cell + Math.floor(hash(gx, gy, 5.1 + codeNum) * cell);
+          const ty = gy * cell + Math.floor(hash(gx, gy, 9.7 + codeNum) * cell);
+          if (this.tileAt(tx, ty) !== codeNum) continue;
+          // Stable per-cell variant pick — the same spot always renders the
+          // same sprite across frames/reloads, but which variant it is
+          // depends only on lattice position, giving natural-looking mix.
+          const vi = Math.floor(hash(gx, gy, 41.3 + codeNum) * variants.length) % variants.length;
+          decor.push({ x: tx * TILE + TILE / 2, y: ty * TILE + TILE / 2, w, h, img: variants[vi] });
+        }
       }
     }
-    trees.sort((a, b) => a.y - b.y);
-    return trees;
+    decor.sort((a, b) => a.y - b.y);
+    return decor;
   }
 
   draw() {
     const { ctx, canvas } = this;
-    const camX = Math.round(this.charX - canvas.width / 2);
-    const camY = Math.round(this.charY - canvas.height / 2);
+    const zoom = this.zoom;
+    // The visible window in world pixels grows as you zoom out; the camera
+    // keeps the player centered within it.
+    const viewW = canvas.width / zoom;
+    const viewH = canvas.height / zoom;
+    const camX = this.charX - viewW / 2;
+    const camY = this.charY - viewH / 2;
+    // World → screen. Chunks round their EDGES through this so adjacent
+    // chunks always share the exact same device pixel — a scale transform
+    // instead leaves subpixel gaps that show as white grid lines when
+    // zoomed out.
+    const sx = (wx) => (wx - camX) * zoom;
+    const sy = (wy) => (wy - camY) * zoom;
 
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.imageSmoothingEnabled = false;
 
     const span = CHUNK * TILE;
     const c0x = Math.floor(camX / span);
-    const c1x = Math.floor((camX + canvas.width) / span);
+    const c1x = Math.floor((camX + viewW) / span);
     const c0y = Math.floor(camY / span);
-    const c1y = Math.floor((camY + canvas.height) / span);
+    const c1y = Math.floor((camY + viewH) / span);
     for (let cy = c0y; cy <= c1y; cy++) {
+      const y0 = Math.round(sy(cy * span));
+      const y1 = Math.round(sy((cy + 1) * span));
       for (let cx = c0x; cx <= c1x; cx++) {
         const chunk = this.chunks.get(cx + ',' + cy);
-        if (chunk) ctx.drawImage(chunk.canvas, cx * span - camX, cy * span - camY);
+        if (!chunk) continue;
+        const x0 = Math.round(sx(cx * span));
+        const x1 = Math.round(sx((cx + 1) * span));
+        ctx.drawImage(chunk.canvas, x0, y0, x1 - x0, y1 - y0);
       }
     }
 
-    // Depth-sorted scene: trees above the player's feet render behind them,
-    // trees below render in front, so walking "through" the forest reads
-    // correctly. Trees are pre-sorted top-to-bottom so they stack cleanly.
-    const { idle, walk, water, tree } = this.images;
-    const trees = tree ? this.visibleTrees(camX, camY) : [];
+    // Depth-sorted scene: decorations above the player's feet render behind
+    // them, ones below render in front, so walking "through" a forest or
+    // mountain range reads correctly. Decor is pre-sorted top-to-bottom so
+    // sprites stack cleanly.
+    const { idle, walk, water } = this.images;
+    const decor = this.visibleDecor(camX, camY, viewW, viewH);
     const playerBase = this.feetY();
     const swimming = this.inWater();
 
-    const drawTree = (t) => {
-      ctx.drawImage(tree, 0, 0, 16, 16, Math.round(t.x - camX - TREE_W / 2), Math.round(t.y - camY - TREE_H), TREE_W, TREE_H);
+    const drawDecor = (t) => {
+      const w = Math.max(1, Math.round(t.w * zoom));
+      const h = Math.max(1, Math.round(t.h * zoom));
+      ctx.drawImage(t.img, 0, 0, t.img.width, t.img.height, Math.round(sx(t.x)) - (w >> 1), Math.round(sy(t.y)) - h, w, h);
     };
     const drawPlayer = () => {
-      const dx = Math.round(this.charX - camX - CHAR_DRAW / 2);
-      let dy = Math.round(this.charY - camY - CHAR_DRAW / 2);
+      const size = Math.max(1, Math.round(CHAR_DRAW * zoom));
+      const dx = Math.round(sx(this.charX)) - (size >> 1);
+      let dy = Math.round(sy(this.charY)) - (size >> 1);
       if (swimming && water) {
         const frame = Math.floor(this.time * WATER_FPS) % 2;
-        ctx.drawImage(water, frame * 16, 0, 16, 16, dx, dy, CHAR_DRAW, CHAR_DRAW);
+        ctx.drawImage(water, frame * 16, 0, 16, 16, dx, dy, size, size);
         return;
       }
       if (this.moving && walk) {
         const frame = Math.floor(this.time * WALK_FPS) % 2;
-        ctx.drawImage(walk, frame * 16, 0, 16, 16, dx, dy, CHAR_DRAW, CHAR_DRAW);
+        ctx.drawImage(walk, frame * 16, 0, 16, 16, dx, dy, size, size);
         return;
       }
       if (idle) {
         const frames = Math.max(1, Math.floor(idle.width / 16));
         if (frames >= 2) {
           const frame = Math.floor(this.time / IDLE_SPF) % frames;
-          ctx.drawImage(idle, frame * 16, 0, 16, 16, dx, dy, CHAR_DRAW, CHAR_DRAW);
+          ctx.drawImage(idle, frame * 16, 0, 16, 16, dx, dy, size, size);
         } else {
           // Single idle frame: fake the second frame with a gentle
           // breathing bob on the same 1s cadence.
-          dy += Math.floor(this.time / IDLE_SPF) % 2 === 0 ? 0 : 3;
-          ctx.drawImage(idle, 0, 0, 16, 16, dx, dy, CHAR_DRAW, CHAR_DRAW);
+          dy += Math.floor(this.time / IDLE_SPF) % 2 === 0 ? 0 : Math.max(1, Math.round(3 * zoom));
+          ctx.drawImage(idle, 0, 0, 16, 16, dx, dy, size, size);
         }
       }
     };
 
     let i = 0;
-    while (i < trees.length && trees[i].y <= playerBase) {
-      drawTree(trees[i]);
+    while (i < decor.length && decor[i].y <= playerBase) {
+      drawDecor(decor[i]);
       i++;
     }
     drawPlayer();
-    while (i < trees.length) {
-      drawTree(trees[i]);
+    while (i < decor.length) {
+      drawDecor(decor[i]);
       i++;
     }
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
 }

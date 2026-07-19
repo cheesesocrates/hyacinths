@@ -72,6 +72,86 @@ body {
   padding: 8px 12px;
 }
 
+.confirm-pop {
+  position: fixed;
+  top: 44px;
+  left: calc(50% + 300px);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: rgba(20, 24, 18, 0.7);
+  backdrop-filter: blur(16px) saturate(1.5);
+  -webkit-backdrop-filter: blur(16px) saturate(1.5);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 14px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+  color: #f2f6ec;
+  font-size: 14px;
+  z-index: 11;
+  animation: pop-in 180ms ease-out backwards;
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.confirm-pop button {
+  border: none;
+  border-radius: 9px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.confirm-pop .yes {
+  background: rgba(139, 216, 78, 0.9);
+  color: #1c2b12;
+}
+
+.confirm-pop .no {
+  background: rgba(230, 110, 100, 0.85);
+  color: #2b1512;
+}
+
+.zoom-bar {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 10;
+}
+
+.zoom-bar button {
+  width: 44px;
+  height: 44px;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(16px) saturate(1.5);
+  -webkit-backdrop-filter: blur(16px) saturate(1.5);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  color: #17220f;
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.zoom-bar button:active {
+  background: rgba(255, 255, 255, 0.3);
+}
+
 .toast {
   position: fixed;
   top: 104px;

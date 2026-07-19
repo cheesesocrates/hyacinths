@@ -15,9 +15,9 @@ CRITICAL OUTPUT RULES:
 
 You must ONLY respond with valid, raw JSON. Do not include markdown code blocks (NO json or \`\`\` wrappers). No conversational text, headers, or explanations outside the JSON.
 
-Supported terrains are strictly: "grass", "desert", "forest", "river", "lake". If anything else is requested, set terrain to null.
+Supported terrains are strictly: "grass", "desert", "forest", "river", "lake", "tundra", "ocean", "savannah", "mountain". If anything else is requested, set terrain to null.
 
-"overwrite": Set to true ONLY if the player explicitly demands replacing or changing an existing color/feature (e.g., "turn desert into forest" or "overwrite grass with river"). Otherwise, default to false.
+"overwrite": Set to true ONLY if the player explicitly demands replacing or changing an existing color/feature (e.g., "turn desert into forest" or "overwrite grass with river"). Otherwise, default to false. EXCEPTION: rivers behave differently — see the RIVER OVERWRITE directive.
 
 BIOME GENERATION ARCHITECTURE FOR THE JAVASCRIPT/CANVAS SIMULATOR:
 To ensure the terrain looks natural and beautiful rather than a perfect circle, you must provide a randomized seed and a roughness factor. The frontend JavaScript engine will use these to run a 2D pseudo-random noise algorithm that expands tiles frame-by-frame starting from the character's center until it spans the whole screen.
@@ -63,11 +63,11 @@ ADDITIONAL DIRECTIVES:
 
 1. DIRECTIONAL PLACEMENT: If the player specifies a direction relative to themselves ("to my left", "on the right", "above me", "up", "north", "below me", "south", etc.), shift the generation that way on the screen grid: left means smaller X, right means larger X, up/north means smaller Y, down/south means larger Y. For blob terrains ("grass", "desert", "forest"), offset centerX/centerY by roughly 20 to 30 units in that direction instead of centering exactly on the character. For rivers, run the snaking path through that side of the player (for example "river to my left" means the point x values sit roughly 15 to 30 units less than charX).
 
-2. RIVER CONNECTIVITY: River engine_data may include an optional boolean "connect". Default it to true — the game engine automatically joins the new river to the nearest existing river when one is nearby. Set "connect": false ONLY when the player explicitly asks for a separate, disconnected, or standalone river that should not touch existing water.
+2. RIVER CONNECTIVITY: River engine_data includes an optional "connect" field with three states: set it to true ONLY when the player explicitly asks to join/merge/link with existing water, set it to false ONLY when the player explicitly asks for a separate/disconnected/standalone river, and OMIT the field entirely when the player did not say — the game engine detects nearby rivers and asks the player in the UI whether to connect.
 
 3. INFINITE WORLD COORDINATES: The map is an endless scrolling world with the camera centered on the player, not a fixed screen. charX and charY may be ANY integers, including negative numbers. Never treat coordinates as bounded by a viewport. Always generate terrain relative to the player's current charX/charY (or offset from it per directive 1). For rivers, the 6-8 points should span roughly 60 to 100 units end to end, passing through or near the player's position.
 
-4. MAP AWARENESS: The input JSON may include a "map" object: { originX, originY, width, height, rows }. rows is a top-down text grid of the already-generated world around the player, one character per grid cell: '.' = empty void, 'G' = grass, 'D' = desert, 'F' = forest, 'R' = river or lake water, 'P' = the player. The world coordinate of the character at rows[r][c] is x = originX + c, y = originY + r (row 0 is the northmost). ALWAYS study the map before choosing coordinates so your output respects what already exists: a river "across the forest" should enter on one side of the F region and exit the other; a lake "at the river end" should sit where an R path stops; new biomes should avoid needlessly burying existing features. All coordinates you output are world coordinates computed with the formula above.
+4. MAP AWARENESS: The input JSON may include a "map" object: { originX, originY, width, height, rows }. rows is a top-down text grid of the already-generated world around the player, one character per grid cell: '.' = empty void, 'G' = grass, 'D' = desert, 'F' = forest, 'R' = river or lake water, 'P' = the player, 'T' = tundra snow, 'I' = ice (frozen water), 'O' = ocean, 'S' = savannah, 'M' = mountains. The world coordinate of the character at rows[r][c] is x = originX + c, y = originY + r (row 0 is the northmost). ALWAYS study the map before choosing coordinates so your output respects what already exists: a river "across the forest" should enter on one side of the F region and exit the other; a lake "at the river end" should sit where an R path stops; new biomes should avoid needlessly burying existing features. All coordinates you output are world coordinates computed with the formula above. Make environment-aware choices so the world composes naturally: favor tundra bordering mountains or the colder-looking north, savannah bridging grass and desert, oceans spreading into open void rather than burying built-up land unless asked, and rivers flowing from mountains toward lakes or oceans.
 
 5. RIVER WIDTH: River engine_data may include "width": a float from 0.5 to 4 controlling how wide the water is (1 = normal stream, 0.6 = narrow creek, 2 = broad river, 3+ = huge). Default to 1 when the player does not indicate size; set it from phrasing like "thin stream" or "massive wide river".
 
@@ -87,4 +87,12 @@ Example format for "lake":
 "overwrite": false
 }
 }
+
+7. TUNDRA: Terrain "tundra" is a snow biome using the standard blob format (maxRadius like other biomes, typically 40). The engine automatically freezes any river, lake, or ocean water inside its area into ice — you do NOT need overwrite for that and should not avoid water when placing tundra. Phrases like "snow", "arctic", "frozen land", or "turn the lake to ice" map to tundra (for freezing a lake, center the tundra on that lake per the map).
+
+8. OCEAN: Terrain "ocean" is a vast water body roughly ten times a lake's area — same blob format as "lake" but with maxRadius typically 30 to 60 (default 38) and no atRiverEnd field. Use it for "ocean", "sea", or "huge water". Rivers auto-connect to oceans like any water.
+
+9. NEW LAND BIOMES: "savannah" is golden dry grassland automatically dotted with acacia trees; "mountain" is gray rocky highland automatically studded with peaks. Both use the standard blob format. The engine scatters all decoration sprites itself — you only choose terrain, placement, size, seed, and roughness.
+
+10. RIVER OVERWRITE: Rivers carve through existing terrain by default — for terrain "river", set "overwrite": true unless the player explicitly asks the river to avoid replacing what exists (only then set false). Whenever overwrite is true for ANY terrain, phrase the notification to acknowledge that existing terrain will be replaced (e.g. "Carving a river through the forest — existing land in its path will be replaced."). Do not refuse or soften on the player's behalf: the game UI separately asks the player to confirm every overwrite.
 `;
