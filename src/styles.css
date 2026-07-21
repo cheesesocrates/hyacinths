@@ -23,6 +23,7 @@ body {
   left: 50%;
   transform: translateX(-50%);
   display: flex;
+  align-items: center;
   gap: 6px;
   padding: 6px;
   background: rgba(255, 255, 255, 0.16);
@@ -32,10 +33,17 @@ body {
   border-radius: 18px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
   z-index: 10;
+  transition: background 0.4s, border-color 0.4s;
+}
+
+.input-wrap {
+  position: relative;
+  width: 440px;
 }
 
 .command-bar input {
-  width: 440px;
+  display: block;
+  width: 100%;
   padding: 10px 14px;
   border: none;
   border-radius: 12px;
@@ -47,6 +55,21 @@ body {
 
 .command-bar input::placeholder {
   color: rgba(23, 34, 15, 0.45);
+}
+
+.placeholder-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.3em;
+  padding: 10px 14px;
+  font-size: 15px;
+  color: rgba(23, 34, 15, 0.45);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
 }
 
 .command-bar button {
@@ -65,11 +88,43 @@ body {
   cursor: wait;
 }
 
-.command-bar button.undo {
+.command-bar button.undo,
+.command-bar button.share {
   background: rgba(255, 255, 255, 0.3);
   color: #17220f;
   font-size: 16px;
   padding: 8px 12px;
+}
+
+/* Splash screen: shown before the player's first prompt — big, lower,
+   nothing else on screen. GSAP animates the shrink back to .command-bar's
+   plain values above the moment they submit. */
+.command-bar.splash {
+  top: 27vh;
+  padding: 14px;
+  border-radius: 26px;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.command-bar.splash .input-wrap {
+  width: 620px;
+}
+
+.command-bar.splash input {
+  padding: 20px 26px;
+  font-size: 22px;
+  border-radius: 16px;
+}
+
+.command-bar.splash .placeholder-overlay {
+  padding: 20px 26px;
+  font-size: 22px;
+}
+
+.command-bar.splash button[type='submit'] {
+  padding: 18px 30px;
+  font-size: 19px;
+  border-radius: 16px;
 }
 
 .confirm-pop {

@@ -11,6 +11,18 @@ const API_KEY = process.env.GEMINI_API_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 
+// Optional Gemini "thinking" budget. Left UNSET by default: several models
+// (e.g. gemini-flash-lite-latest) reject an explicit thinkingBudget of 0
+// with a 400 INVALID_ARGUMENT, and the lite/default models don't think
+// anyway — so we simply omit thinkingConfig unless a budget is configured.
+// Set GEMINI_THINKING_BUDGET (e.g. 0 to force-disable thinking on a model
+// that supports it, or -1 for dynamic) only if your chosen model accepts it.
+const _rawThinkingBudget = process.env.GEMINI_THINKING_BUDGET;
+const THINKING_BUDGET =
+  _rawThinkingBudget != null && _rawThinkingBudget.trim() !== '' && Number.isFinite(Number(_rawThinkingBudget))
+    ? Number(_rawThinkingBudget)
+    : null;
+
 const TERRAINS = new Set(['grass', 'desert', 'forest', 'river', 'lake', 'tundra', 'ocean', 'savannah', 'mountain']);
 
 const INVALID = (notification = 'I cannot create that environment yet.') => ({
@@ -84,12 +96,34 @@ function validateMap(map) {
   const { originX, originY, width, height, rows } = map;
   if (!Number.isInteger(originX) || !Number.isInteger(originY)) return null;
   if (!Array.isArray(rows) || !rows.every((r) => typeof r === 'string')) return null;
-  return {
+  const result = {
     originX,
     originY,
     width,
     height,
-    rows: rows.slice(0, 100).map((r) => r.slice(0, 200))
+    rows: rows.slice(0, 150).map((r) => r.slice(0, 240))
+  };
+  const overview = validateOverview(map.overview);
+  if (overview) result.overview = overview;
+  return result;
+}
+
+// Same idea as validateMap, but for the optional coarse whole-world summary
+// grid. Missing or malformed input simply means the field is omitted from
+// the validated map entirely — it's a nice-to-have for big-picture awareness,
+// never a reason to reject or throw.
+function validateOverview(overview) {
+  if (!overview || typeof overview !== 'object' || Array.isArray(overview)) return null;
+  const { originX, originY, block, width, height, rows } = overview;
+  if (!Number.isInteger(originX) || !Number.isInteger(originY) || !Number.isInteger(block)) return null;
+  if (!Array.isArray(rows) || !rows.every((r) => typeof r === 'string')) return null;
+  return {
+    originX,
+    originY,
+    block,
+    width,
+    height,
+    rows: rows.slice(0, 60).map((r) => r.slice(0, 90))
   };
 }
 
@@ -111,7 +145,9 @@ async function askGemini(command, charX, charY, map) {
         temperature: 0.9,
         responseMimeType: 'application/json',
         maxOutputTokens: 4096,
-        thinkingConfig: { thinkingBudget: 0 }
+        // Only include a thinking budget when one is explicitly configured;
+        // otherwise omit it entirely (see THINKING_BUDGET above).
+        ...(THINKING_BUDGET !== null ? { thinkingConfig: { thinkingBudget: THINKING_BUDGET } } : {})
       }
     })
   });
@@ -155,7 +191,14 @@ function sanitize(raw, charX, charY) {
   const notification = typeof raw.notification === 'string' ? raw.notification.slice(0, 200) : 'The land shifts.';
   const ed = raw.engine_data;
   const terrain = TERRAINS.has(ed.terrain) ? ed.terrain : null;
-  if (!terrain) return INVALID(notification);
+  if (!terrain) {
+    // A pure clouds on/off command has no terrain at all — don't let the
+    // generic INVALID() response swallow the clouds field in that case.
+    if (typeof ed.clouds === 'boolean') {
+      return { notification, engine_data: { terrain: null, overwrite: false, clouds: ed.clouds } };
+    }
+    return INVALID(notification);
+  }
   const overwrite = ed.overwrite === true;
   const num = (v, fallback) => (Number.isFinite(Number(v)) ? Number(v) : fallback);
 
@@ -178,7 +221,7 @@ function sanitize(raw, charX, charY) {
         terrain,
         centerX: Math.round(num(ed.centerX, charX)),
         centerY: Math.round(num(ed.centerY, charY)),
-        maxRadius: Math.min(30, Math.max(4, num(ed.maxRadius, 12))),
+        maxRadius: Math.min(60, Math.max(4, num(ed.maxRadius, 12))),
         seed: num(ed.seed, Math.random() * 1000),
         roughness: Math.min(0.8, Math.max(0.3, num(ed.roughness, 0.55))),
         atRiverEnd: ed.atRiverEnd === true,
@@ -194,7 +237,7 @@ function sanitize(raw, charX, charY) {
         terrain,
         centerX: Math.round(num(ed.centerX, charX)),
         centerY: Math.round(num(ed.centerY, charY)),
-        maxRadius: Math.min(70, Math.max(20, num(ed.maxRadius, 38))),
+        maxRadius: Math.min(140, Math.max(20, num(ed.maxRadius, 38))),
         seed: num(ed.seed, Math.random() * 1000),
         roughness: Math.min(0.8, Math.max(0.3, num(ed.roughness, 0.55))),
         overwrite
@@ -208,7 +251,7 @@ function sanitize(raw, charX, charY) {
       terrain,
       centerX: Math.round(num(ed.centerX, charX)),
       centerY: Math.round(num(ed.centerY, charY)),
-      maxRadius: Math.min(80, Math.max(5, num(ed.maxRadius, 40))),
+      maxRadius: Math.min(160, Math.max(5, num(ed.maxRadius, 40))),
       seed: num(ed.seed, Math.random() * 1000),
       roughness: Math.min(0.8, Math.max(0.3, num(ed.roughness, 0.55))),
       overwrite
@@ -250,6 +293,20 @@ function detectConnectState(text) {
 // mentioned, so "turn desert into forest" resolves to forest.
 function offlineFallback(command, charX, charY, apiFailed, debug) {
   const text = String(command).toLowerCase();
+  const suffix = apiFailed ? ' [AI unreachable — offline mode]' : ' [offline mode — no API key]';
+
+  // Clouds are a standalone toggle, independent of terrain — handle it first
+  // and skip the terrain synonym scan entirely when this is what's meant.
+  if (/\bclouds?\b/i.test(text)) {
+    const cloudsOff = /\b(remove|hide|clear|off|no|stop|disable)\b/i.test(text);
+    const result = {
+      notification: 'Clouds drifting in overhead.' + suffix,
+      engine_data: { terrain: null, overwrite: false, clouds: !cloudsOff }
+    };
+    if (debug) result.debug = debug;
+    return result;
+  }
+
   const synonyms = {
     grass: ['grass', 'meadow', 'field', 'plains'],
     desert: ['desert', 'sand', 'dune'],
@@ -281,8 +338,6 @@ function offlineFallback(command, charX, charY, apiFailed, debug) {
   if (hasLakeWord && hasRiverWord && /(lake|pond|lagoon).*(river|stream)/.test(text)) {
     terrain = 'lake';
   }
-
-  const suffix = apiFailed ? ' [AI unreachable — offline mode]' : ' [offline mode — no API key]';
 
   let result;
   if (!terrain) {

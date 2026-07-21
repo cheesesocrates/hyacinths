@@ -68,6 +68,12 @@ const GameCanvas = forwardRef(function GameCanvas(_props, ref) {
     },
     hasRiverNear(points) {
       return engineRef.current ? engineRef.current.hasRiverNear(points) : false;
+    },
+    setClouds(on) {
+      engineRef.current?.setClouds(on);
+    },
+    renderFullMap() {
+      return engineRef.current ? engineRef.current.renderFullMap() : null;
     }
   }));
 
