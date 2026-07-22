@@ -192,10 +192,13 @@ function sanitize(raw, charX, charY) {
   const ed = raw.engine_data;
   const terrain = TERRAINS.has(ed.terrain) ? ed.terrain : null;
   if (!terrain) {
-    // A pure clouds on/off command has no terrain at all — don't let the
-    // generic INVALID() response swallow the clouds field in that case.
-    if (typeof ed.clouds === 'boolean') {
-      return { notification, engine_data: { terrain: null, overwrite: false, clouds: ed.clouds } };
+    // A pure toggle command (clouds or wildlife) has no terrain at all —
+    // don't let the generic INVALID() response swallow those flags.
+    const toggles = {};
+    if (typeof ed.clouds === 'boolean') toggles.clouds = ed.clouds;
+    if (typeof ed.animals === 'boolean') toggles.animals = ed.animals;
+    if (Object.keys(toggles).length) {
+      return { notification, engine_data: { terrain: null, overwrite: false, ...toggles } };
     }
     return INVALID(notification);
   }
@@ -302,6 +305,18 @@ function offlineFallback(command, charX, charY, apiFailed, debug) {
     const result = {
       notification: 'Clouds drifting in overhead.' + suffix,
       engine_data: { terrain: null, overwrite: false, clouds: !cloudsOff }
+    };
+    if (debug) result.debug = debug;
+    return result;
+  }
+
+  // Savanna wildlife is a standalone toggle too — same short-circuit as
+  // clouds, before the terrain scan (so "animals" never reads as a biome).
+  if (/\b(animals?|wildlife|lions?|zebras?|predators?|prey)\b/i.test(text)) {
+    const animalsOff = /\b(remove|hide|clear|off|no|stop|disable|kill|without)\b/i.test(text);
+    const result = {
+      notification: (animalsOff ? 'The savanna wildlife wanders off.' : 'Lions and zebras roam the savanna.') + suffix,
+      engine_data: { terrain: null, overwrite: false, animals: !animalsOff }
     };
     if (debug) result.debug = debug;
     return result;

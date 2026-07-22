@@ -72,6 +72,9 @@ const GameCanvas = forwardRef(function GameCanvas(_props, ref) {
     setClouds(on) {
       engineRef.current?.setClouds(on);
     },
+    setAnimals(on) {
+      engineRef.current?.setAnimals(on);
+    },
     renderFullMap() {
       return engineRef.current ? engineRef.current.renderFullMap() : null;
     }

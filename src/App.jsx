@@ -68,6 +68,17 @@ export default function App() {
   // Questions the player must answer before terrain applies:
   // { data, steps: ['connect'?, 'overwrite'?] } — answered front to back.
   const [pending, setPending] = useState(null);
+  // Savanna wildlife: off at first. A sidebar slides in from the right to
+  // point players at the toggle; the create bar can flip it too (ed.animals).
+  const [animalsOn, setAnimalsOn] = useState(false);
+  const [wildlifeOpen, setWildlifeOpen] = useState(false);
+
+  // Single path for flipping the wildlife on/off, shared by the sidebar
+  // switch and the create-bar command so the UI and engine never disagree.
+  const toggleAnimals = (on) => {
+    setAnimalsOn(on);
+    gameRef.current?.setAnimals(on);
+  };
 
   const showToast = (text, detail) => {
     clearTimeout(toastTimer.current);
@@ -90,6 +101,13 @@ export default function App() {
   useEffect(() => () => {
     clearTimeout(toastTimer.current);
     clearInterval(settleTimer.current);
+  }, []);
+
+  // The wildlife sidebar announces itself shortly after load, sliding in from
+  // the right so players discover the animals toggle (they start off).
+  useEffect(() => {
+    const t = setTimeout(() => setWildlifeOpen(true), 1400);
+    return () => clearTimeout(t);
   }, []);
 
   // Splash-screen placeholder: only the suffix after "create" scrambles
@@ -300,6 +318,11 @@ export default function App() {
       if (ed && typeof ed.clouds === 'boolean') {
         gameRef.current?.setClouds(ed.clouds);
       }
+      // Wildlife is a standalone toggle too — flip it (and reflect the state
+      // in the sidebar switch) before the "nothing to do" return below.
+      if (ed && typeof ed.animals === 'boolean') {
+        toggleAnimals(ed.animals);
+      }
       if (!ed || !ed.terrain) {
         showToast(note, data.debug);
         setCommand('');
@@ -442,6 +465,42 @@ export default function App() {
           {toast.detail && <div className="toast-detail">{toast.detail}</div>}
         </div>
       )}
+      {!wildlifeOpen && (
+        <button
+          type="button"
+          className="wildlife-handle"
+          onClick={() => setWildlifeOpen(true)}
+          title="Wildlife"
+          aria-label="Show wildlife panel"
+        >
+          🦓
+        </button>
+      )}
+      <div className={wildlifeOpen ? 'wildlife-panel open' : 'wildlife-panel'}>
+        <div className="wildlife-body">
+          <div className="wildlife-head">
+            <span className="wildlife-title">Savanna wildlife</span>
+            <button type="button" className="wildlife-close" onClick={() => setWildlifeOpen(false)} title="Hide">
+              ×
+            </button>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={animalsOn}
+            className={animalsOn ? 'wildlife-switch on' : 'wildlife-switch'}
+            onClick={() => toggleAnimals(!animalsOn)}
+          >
+            <span className="wildlife-switch-label">Animals</span>
+            <span className="wildlife-track">
+              <span className="wildlife-knob" />
+            </span>
+          </button>
+          <p className="wildlife-hint">
+            Lions hunt and zebras bolt across the <b>savannah</b>. You can toggle animals through the create bar too.
+          </p>
+        </div>
+      </div>
     </>
   );
 }

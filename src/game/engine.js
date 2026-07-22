@@ -111,6 +111,64 @@ const CLOUD_WIND = { x: Math.cos(0.18), y: Math.sin(0.18) };
 const CLOUD_BOB_AMP = 3; // screen px of vertical jiggle
 const CLOUD_BOB_RATE = 5.5; // how fast the jiggle steps
 
+// ── Predator–prey wildlife (savanna) ──────────────────────────────────
+// Lions hunt; zebras graze and bolt. The whole sim is deliberately cheap:
+// populations are small and capped, targets are re-evaluated only on a
+// coarse "think" tick (not every frame), and that tick compares SQUARED
+// distances in a single shared lion×zebra pass — so per frame it's just a
+// handful of moves with no sqrt-heavy neighbour search. Off until the player
+// toggles it on (the create bar or the wildlife sidebar).
+const TAU = Math.PI * 2;
+const ANIMAL_SPAWN_CHECK = 1.0; // seconds between spawn attempts
+const ANIMAL_THINK = 0.2; // seconds between AI target re-evaluations
+const MAX_LIONS = 4;
+const MAX_ZEBRAS = 9;
+const ANIMAL_SPAWN_MIN = 160; // ring (world px) around the player they appear in
+const ANIMAL_SPAWN_MAX = 620;
+const ANIMAL_DESPAWN_DIST = 1500; // culled past this from the player
+
+const LION_SIGHT = 260; // a lion chases prey within this — its "reach"
+const ZEBRA_SIGHT = LION_SIGHT / 2; // a zebra only notices a lion at half that range…
+const ZEBRA_SAFE = LION_SIGHT; // …then keeps bolting until the lion is past its full reach (hysteresis)
+
+const LION_WANDER_SPEED = 42; // px/s ambling & searching
+const LION_CHASE_SPEED = 132; // px/s sprinting after prey
+const ZEBRA_WANDER_SPEED = 52; // grazing drift — already a touch quicker than a lion's amble
+const ZEBRA_FLEE_SPEED = 170; // faster than a charging lion, so a zebra can pull away and escape
+
+const ANIMAL_BOUNCE = 5; // base hop height (world px) — animals bob rather than glide
+const ANIMAL_RUN_BOUNCE = 1.8; // hop grows by this factor while running
+const ANIMAL_BOUNCE_RATE = 0.16; // hop cadence per unit of travel (faster gait → quicker patter)
+const ANIMAL_DRAW_PAD = 40; // viewport cull margin for drawing (≥ the biggest animal)
+
+// Per-kind behaviour profile shared by every instance of that animal. Wander
+// alternates short random moves with pauses: zebras pause OFTEN and LONG
+// (heads-down grazing), lions pause RARELY and BRIEFLY (restless hunters).
+// `flee` turns a chase into a run-away; wanderSpeed/runSpeed are the slow
+// amble vs the fast chase/flee sprint.
+const LION_PROFILE = {
+  pool: 'lion',
+  size: 34,
+  flee: false,
+  wanderSpeed: LION_WANDER_SPEED,
+  runSpeed: LION_CHASE_SPEED,
+  moveTime: [0.7, 1.6],
+  pauseTime: [0.15, 0.5]
+};
+const ZEBRA_PROFILE = {
+  pool: 'zebra',
+  size: 30,
+  flee: true,
+  wanderSpeed: ZEBRA_WANDER_SPEED,
+  runSpeed: ZEBRA_FLEE_SPEED,
+  moveTime: [0.6, 1.3],
+  pauseTime: [0.8, 2.2]
+};
+
+function randRange(range) {
+  return range[0] + Math.random() * (range[1] - range[0]);
+}
+
 const FOREST_TREE_DENSITY = 0.9;
 
 // Decor renders at ONE fixed scale — its base cell spacing and base draw
@@ -335,6 +393,12 @@ export class Engine {
     this._twSpawnT = 0;
     this.clouds = [];
     this.cloudsOn = false;
+    // Predator–prey wildlife — empty and off until toggled on.
+    this.lions = [];
+    this.zebras = [];
+    this.animalsOn = false;
+    this._animSpawnT = 0;
+    this._animThinkT = 0;
     this.resize(window.innerWidth, window.innerHeight);
   }
 
@@ -802,6 +866,7 @@ export class Engine {
     this._updateTrample(dt);
     this._updateTumbleweeds(dt);
     this._updateClouds(dt);
+    if (this.animalsOn) this._updateAnimals(dt);
 
     for (const job of this.jobs) {
       job.front += job.speed * dt;
@@ -1031,6 +1096,280 @@ export class Engine {
     this.cloudsOn = !!on;
     if (this.cloudsOn) this._stockClouds();
     else this.clouds = [];
+  }
+
+  // Toggles the savanna wildlife. On starts the spawn/think loop (animals
+  // fade in on nearby savannah); off clears the herds at once. Mirrors
+  // setClouds — the create bar (AI `animals` flag) and the wildlife sidebar
+  // both route through here.
+  setAnimals(on) {
+    this.animalsOn = !!on;
+    if (!this.animalsOn) {
+      this.lions = [];
+      this.zebras = [];
+      this._animSpawnT = 0;
+      this._animThinkT = 0;
+    }
+  }
+
+  _updateAnimals(dt) {
+    this._spawnAnimals(dt);
+    this._thinkAnimals(dt);
+    for (const l of this.lions) this._stepAnimal(l, dt, l.target);
+    for (const z of this.zebras) this._stepAnimal(z, dt, z.threat);
+  }
+
+  // Population upkeep runs only on the spawn tick (not every frame): top the
+  // herds up toward their caps on nearby savannah, then cull anything that
+  // has fallen far behind the wandering player.
+  _spawnAnimals(dt) {
+    this._animSpawnT += dt;
+    if (this._animSpawnT < ANIMAL_SPAWN_CHECK) return;
+    this._animSpawnT = 0;
+    if (this.lions.length < MAX_LIONS) this._trySpawn(this.lions, LION_PROFILE);
+    // Prey outnumber predators, so make two attempts at a zebra per tick.
+    if (this.zebras.length < MAX_ZEBRAS) this._trySpawn(this.zebras, ZEBRA_PROFILE);
+    if (this.zebras.length < MAX_ZEBRAS) this._trySpawn(this.zebras, ZEBRA_PROFILE);
+    this._cullAnimals();
+  }
+
+  // One spawn attempt at a random spot in a ring around the player; it takes
+  // only if that spot is savannah, so herds exist exactly where their biome
+  // does and nowhere else.
+  _trySpawn(arr, prof) {
+    const ang = Math.random() * TAU;
+    const dist = ANIMAL_SPAWN_MIN + Math.random() * (ANIMAL_SPAWN_MAX - ANIMAL_SPAWN_MIN);
+    const x = this.charX + Math.cos(ang) * dist;
+    const y = this.charY + Math.sin(ang) * dist;
+    if (this.tileAt(Math.floor(x / TILE), Math.floor(y / TILE)) !== TERRAIN.SAVANNAH) return;
+    const heading = Math.random() * TAU;
+    arr.push({
+      x,
+      y,
+      prof,
+      dx: Math.cos(heading),
+      dy: Math.sin(heading),
+      paused: false,
+      running: false,
+      stateT: 0,
+      bobPhase: Math.random() * TAU,
+      face: Math.random() < 0.5 ? -1 : 1,
+      variant: Math.floor(Math.random() * 997),
+      target: null,
+      threat: null,
+      fleeing: false
+    });
+  }
+
+  _cullAnimals() {
+    const far = ANIMAL_DESPAWN_DIST * ANIMAL_DESPAWN_DIST;
+    const near = (a) => {
+      const dx = a.x - this.charX;
+      const dy = a.y - this.charY;
+      return dx * dx + dy * dy < far;
+    };
+    const beforeL = this.lions.length;
+    const beforeZ = this.zebras.length;
+    this.lions = this.lions.filter(near);
+    this.zebras = this.zebras.filter(near);
+    // Drop any target/threat pointing at an animal that was just culled so no
+    // one chases (or flees) a ghost in the gap before the next think tick.
+    if (this.zebras.length !== beforeZ) {
+      const alive = new Set(this.zebras);
+      for (const l of this.lions) if (l.target && !alive.has(l.target)) l.target = null;
+    }
+    if (this.lions.length !== beforeL) {
+      const alive = new Set(this.lions);
+      for (const z of this.zebras) {
+        if (z.threat && !alive.has(z.threat)) {
+          z.threat = null;
+          z.fleeing = false;
+        }
+      }
+    }
+  }
+
+  // Coarse AI tick: every ANIMAL_THINK seconds decide who is chasing/fleeing
+  // whom. A SINGLE pass over the lion×zebra pairs finds — using squared
+  // distances only, no sqrt — each lion's nearest zebra AND each zebra's
+  // nearest lion at once. So the sim's one quadratic step runs a few times a
+  // second over a tiny population, never per frame.
+  _thinkAnimals(dt) {
+    this._animThinkT -= dt;
+    if (this._animThinkT > 0) return;
+    this._animThinkT = ANIMAL_THINK;
+    const lions = this.lions;
+    const zebras = this.zebras;
+    // No predators or no prey → nothing to hunt; everyone just wanders.
+    if (!lions.length || !zebras.length) {
+      for (const l of lions) l.target = null;
+      for (const z of zebras) {
+        z.threat = null;
+        z.fleeing = false;
+      }
+      return;
+    }
+    for (const l of lions) {
+      l._nz = null;
+      l._nd2 = Infinity;
+    }
+    for (const z of zebras) {
+      z._nl = null;
+      z._nd2 = Infinity;
+    }
+    for (const l of lions) {
+      for (const z of zebras) {
+        const dx = z.x - l.x;
+        const dy = z.y - l.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < l._nd2) {
+          l._nd2 = d2;
+          l._nz = z;
+        }
+        if (d2 < z._nd2) {
+          z._nd2 = d2;
+          z._nl = l;
+        }
+      }
+    }
+    // Lions lock onto the nearest zebra inside their sight radius.
+    const sight2 = LION_SIGHT * LION_SIGHT;
+    for (const l of lions) l.target = l._nd2 <= sight2 ? l._nz : null;
+    // Zebras bolt once a lion breaches half-sight and keep running until the
+    // nearest lion is past the lion's full reach — a hysteresis band so they
+    // don't flicker on and off right at the boundary.
+    const trigger2 = ZEBRA_SIGHT * ZEBRA_SIGHT;
+    const safe2 = ZEBRA_SAFE * ZEBRA_SAFE;
+    for (const z of zebras) {
+      if (z.fleeing) {
+        if (z._nd2 > safe2) z.fleeing = false;
+      } else if (z._nd2 <= trigger2) {
+        z.fleeing = true;
+      }
+      z.threat = z.fleeing ? z._nl : null;
+    }
+  }
+
+  // Per-frame motion for one animal. `prey` is what it's reacting to: a lion's
+  // target zebra (run toward) or a zebra's threat lion (run away). With none,
+  // it wanders — alternating short random moves and pauses at the slow gait.
+  // Only running animals recompute a heading (one sqrt) each frame; wanderers
+  // reuse their fixed heading, so the common case stays cheap.
+  _stepAnimal(a, dt, prey) {
+    const prof = a.prof;
+    let speed = 0;
+    let moving = false;
+    a.running = false;
+
+    if (prey) {
+      let vx = prey.x - a.x;
+      let vy = prey.y - a.y;
+      if (prof.flee) {
+        vx = -vx;
+        vy = -vy;
+      }
+      const len = Math.hypot(vx, vy) || 1;
+      a.dx = vx / len;
+      a.dy = vy / len;
+      speed = prof.runSpeed;
+      moving = true;
+      a.running = true;
+      a.paused = false;
+      a.stateT = 0; // begin a fresh wander cycle once the coast is clear
+    } else {
+      a.stateT -= dt;
+      if (a.stateT <= 0) {
+        if (a.paused) {
+          a.paused = false;
+          const ang = Math.random() * TAU;
+          a.dx = Math.cos(ang);
+          a.dy = Math.sin(ang);
+          a.stateT = randRange(prof.moveTime);
+        } else {
+          a.paused = true;
+          a.stateT = randRange(prof.pauseTime);
+        }
+      }
+      if (!a.paused) {
+        speed = prof.wanderSpeed;
+        moving = true;
+      }
+    }
+
+    if (moving) {
+      this._moveAnimal(a, speed * dt);
+      a.bobPhase += speed * dt * ANIMAL_BOUNCE_RATE;
+      if (a.dx < -0.05) a.face = -1;
+      else if (a.dx > 0.05) a.face = 1;
+    }
+  }
+
+  // Advances an animal by `step` world px along its heading, but only onto
+  // savannah inside the walkable world. Blocked head-on it slides along
+  // whichever single axis is clear (skimming biome edges instead of sticking);
+  // fully boxed in it turns to a new random heading and waits a frame.
+  _moveAnimal(a, step) {
+    const b = this.worldBounds;
+    const nx = a.x + a.dx * step;
+    const ny = a.y + a.dy * step;
+    if (this._animalCanStand(nx, ny, b)) {
+      a.x = nx;
+      a.y = ny;
+      return;
+    }
+    if (this._animalCanStand(nx, a.y, b)) {
+      a.x = nx;
+      a.dy = -a.dy;
+      return;
+    }
+    if (this._animalCanStand(a.x, ny, b)) {
+      a.y = ny;
+      a.dx = -a.dx;
+      return;
+    }
+    const ang = Math.random() * TAU;
+    a.dx = Math.cos(ang);
+    a.dy = Math.sin(ang);
+  }
+
+  _animalCanStand(x, y, b) {
+    if (b && (x < b.minX - WORLD_MARGIN || x > b.maxX + WORLD_MARGIN || y < b.minY - WORLD_MARGIN || y > b.maxY + WORLD_MARGIN)) {
+      return false;
+    }
+    return this.tileAt(Math.floor(x / TILE), Math.floor(y / TILE)) === TERRAIN.SAVANNAH;
+  }
+
+  // Adds on-screen animals to the scene's depth-sorted draw list as
+  // decor-shaped items (bob = current hop height, flip = facing). Off-screen
+  // animals are skipped by a cheap bounding-box test so a big herd never costs
+  // a draw call it doesn't need.
+  _pushAnimals(decor, camX, camY, viewW, viewH) {
+    const minX = camX - ANIMAL_DRAW_PAD;
+    const maxX = camX + viewW + ANIMAL_DRAW_PAD;
+    const minY = camY - ANIMAL_DRAW_PAD;
+    const maxY = camY + viewH + ANIMAL_DRAW_PAD;
+    const add = (arr) => {
+      for (const a of arr) {
+        if (a.x < minX || a.x > maxX || a.y < minY || a.y > maxY) continue;
+        const pool = this.decor[a.prof.pool];
+        if (!pool || !pool.length) continue;
+        const amp = a.running ? ANIMAL_BOUNCE * ANIMAL_RUN_BOUNCE : ANIMAL_BOUNCE;
+        const bob = a.paused ? 0 : Math.abs(Math.sin(a.bobPhase)) * amp;
+        decor.push({
+          x: a.x,
+          y: a.y,
+          w: a.prof.size,
+          h: a.prof.size,
+          img: pool[a.variant % pool.length],
+          bob,
+          flip: a.face < 0,
+          key: null,
+          interact: null
+        });
+      }
+    };
+    add(this.lions);
+    add(this.zebras);
   }
 
   // Maps a coherence value in [0,1) to a variant index using per-variant
@@ -1271,6 +1610,7 @@ export class Engine {
     // sprites stack cleanly.
     const { idle, walk, water } = this.images;
     const decor = this.visibleDecor(camX, camY, viewW, viewH);
+    let decorDirty = false;
     if (this.tumbleweeds.length) {
       const twPool = this.decor.tumbleweed;
       if (twPool && twPool.length) {
@@ -1281,9 +1621,16 @@ export class Engine {
           const bob = Math.abs(Math.sin(tw.bob)) * TUMBLEWEED_BOUNCE;
           decor.push({ x: tw.x, y: tw.y, w: TUMBLEWEED_SIZE, h: TUMBLEWEED_SIZE, img: twPool[0], rot: tw.ang, bob, key: null, interact: null });
         }
-        decor.sort((a, b) => a.y - b.y);
+        decorDirty = true;
       }
     }
+    // Lions and zebras join the scene's single depth sort, so they occlude and
+    // are occluded by trees and the player correctly as they roam.
+    if (this.animalsOn && (this.lions.length || this.zebras.length)) {
+      this._pushAnimals(decor, camX, camY, viewW, viewH);
+      decorDirty = true;
+    }
+    if (decorDirty) decor.sort((a, b) => a.y - b.y);
     // The player's own on-screen size never changes with zoom (the camera
     // always keeps them dead-center), but the world-space "feet" line decor
     // depth-sorts against must scale with 1/zoom to match that fixed box,
@@ -1320,7 +1667,20 @@ export class Engine {
         ctx.drawImage(t.img, 0, 0, t.img.width, t.img.height, -(w >> 1), -(h >> 1), w, h);
         ctx.restore();
       } else {
-        ctx.drawImage(t.img, 0, 0, t.img.width, t.img.height, Math.round(sx(t.x)) - (w >> 1), Math.round(sy(t.y) + shiftY * zoom) - h, w, h);
+        // bob lifts the sprite straight up (animals hop as they move); flip
+        // mirrors it horizontally to face its direction of travel. Plain
+        // decor sets neither, so it draws exactly as before.
+        const dxp = Math.round(sx(t.x)) - (w >> 1);
+        const dyp = Math.round(sy(t.y) + shiftY * zoom - (t.bob || 0) * zoom) - h;
+        if (t.flip) {
+          ctx.save();
+          ctx.translate(dxp + w, dyp);
+          ctx.scale(-1, 1);
+          ctx.drawImage(t.img, 0, 0, t.img.width, t.img.height, 0, 0, w, h);
+          ctx.restore();
+        } else {
+          ctx.drawImage(t.img, 0, 0, t.img.width, t.img.height, dxp, dyp, w, h);
+        }
       }
       if (alpha < 1) ctx.globalAlpha = 1;
     };
