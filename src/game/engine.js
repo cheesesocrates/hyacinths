@@ -67,24 +67,19 @@ const MAP_NEAR_W = 220;
 const MAP_NEAR_H = 130;
 const MAP_OVERVIEW_MAX = 60;
 
-// Footprint trail: the ground pixels under the player are recolored to
-// churned-up earth — brown on grass, darker dirt in forest, a darker shade
-// of the sand in desert, etc. The dirt is OPAQUE while it exists and then
-// vanishes instantly (no fade gradient) after TRAIL_LIFE. Both the mark
-// SIZE and the STRIDE between marks scale with 1/zoom, so as you zoom out
-// (the player looming larger over the world) the steps get correspondingly
-// bigger — TRAIL_MARK_SIZE and TRAIL_STEP are the values at zoom 1.
-const TRAIL_LIFE = 0.5; // seconds a mark stays before vanishing instantly
-const TRAIL_STEP = 4; // world px between marks at zoom 1 — small, for a dragged look
-const TRAIL_MARK_SIZE = 12; // footprint patch size (world px) at zoom 1
-const TRAIL_COLOR = {
-  [TERRAIN.GRASS]: '#6b4a2b', // brown churned earth
-  [TERRAIN.FOREST]: '#4a3726', // darker forest dirt
-  [TERRAIN.DESERT]: '#b89a2c', // a darker shade of the sand
-  [TERRAIN.TUNDRA]: '#a9c0cd', // darker packed snow
-  [TERRAIN.SAVANNAH]: '#9c7f32',
-  [TERRAIN.MOUNTAIN]: '#5c5c54'
-};
+// The player's footfall no longer paints the ground (no dirt trail), but
+// walking still displaces small decor underfoot — TRAMPLE_FOOTPRINT is the
+// footprint SIZE that reach is judged against (world px at zoom 1, scaled
+// by 1/zoom just like the old trail was) so stepping behavior is unchanged.
+const TRAMPLE_FOOTPRINT = 12;
+
+// Water ripples: while swimming and moving, ripples spawn at the feet and
+// recolor the water's pixels to white in a ring that expands outward over
+// its life — tile-quantized pixel blocks, not a drawn circle.
+const RIPPLE_LIFE = 0.6; // seconds a ripple lives
+const RIPPLE_STEP = 16; // world px between spawns while swimming — keeps rings distinct
+const RIPPLE_MIN_RADIUS = 2; // world px at birth
+const RIPPLE_MAX_RADIUS = 15; // world px at death — visible pixel expansion
 
 // Trample interaction timing (see Engine#_updateTrample): drop into the
 // ground quickly when stepped on, stay gone for about the same beat the
@@ -152,7 +147,7 @@ const DECOR = {
   [TERRAIN.GRASS]: {
     img: 'flower',
     cell: 8,
-    density: 0.48,
+    density: 0.06,
     w: 18,
     h: 18,
     drift: true,
@@ -331,9 +326,9 @@ export class Engine {
     // world is a simple rectangle around it (see #update), and it's also
     // what the share feature and the AI's world overview key off of.
     this.worldBounds = null;
-    this.trails = [];
-    this._trailDist = 0;
-    this._lastTrailPos = null;
+    this.ripples = [];
+    this._rippleDist = 0;
+    this._lastRipplePos = null;
     // key -> { state: 'sinking'|'hidden'|'growing', since, lastNear }
     this.trample = new Map();
     this.tumbleweeds = [];
@@ -754,8 +749,8 @@ export class Engine {
   // Where the sprite's feet VISUALLY land in world px at the current zoom.
   // The player is drawn at a fixed on-screen size, so its feet correspond
   // to a world offset that shrinks as you zoom in and grows as you zoom
-  // out (÷zoom). The footprint trail drops here so a mark always sits
-  // right under the sprite instead of drifting away when the zoom changes.
+  // out (÷zoom). Ripples and the trample check both anchor here so they
+  // track the sprite exactly instead of drifting away as zoom changes.
   visualFeetY() {
     return this.charY + (CHAR_DRAW * 0.42) / this.zoom;
   }
@@ -764,19 +759,19 @@ export class Engine {
     return WATER.has(this.tileAt(Math.floor(this.charX / TILE), Math.floor(this.feetY() / TILE)));
   }
 
-  // Trample is tested from the same spot the dirt mark lands — the sprite's
-  // visual feet — so "walked pixel" means exactly the ground the dirt
-  // covers. Because the footprint is small and sits at the feet, decor just
-  // ahead of the player (drawn in front, above the feet) isn't touched
-  // until you actually step onto its base — the depth illusion survives.
+  // Trample is tested from the sprite's visual feet, so "walked pixel"
+  // means exactly the ground underfoot. Because the footprint is small and
+  // sits at the feet, decor just ahead of the player (drawn in front, above
+  // the feet) isn't touched until you actually step onto its base — the
+  // depth illusion survives.
   _interactionPoint() {
     return { x: this.charX, y: this.visualFeetY() };
   }
 
-  // Radius of the dirt footprint in world px at the current zoom — the
-  // reach within which decor counts as "on a walked pixel".
-  _dirtRadius() {
-    return (TRAIL_MARK_SIZE / this.zoom) * 0.5;
+  // Radius of the footfall in world px at the current zoom — the reach
+  // within which decor counts as "on a walked pixel" and gets trampled.
+  _trampleRadius() {
+    return (TRAMPLE_FOOTPRINT / this.zoom) * 0.5;
   }
 
   update(dt) {
@@ -803,7 +798,7 @@ export class Engine {
       this.charY = b ? Math.min(b.maxY + WORLD_MARGIN, Math.max(b.minY - WORLD_MARGIN, ny)) : ny;
     }
 
-    this._updateTrails(dt);
+    this._updateRipples(dt);
     this._updateTrample(dt);
     this._updateTumbleweeds(dt);
     this._updateClouds(dt);
@@ -818,25 +813,25 @@ export class Engine {
     this.jobs = this.jobs.filter((j) => j.idx < j.tiles.length);
   }
 
-  _updateTrails(dt) {
-    if (this.trails.length) this.trails = this.trails.filter((t) => this.time - t.born < TRAIL_LIFE);
-    if (!this.moving) return;
-    // Drop marks at the sprite's VISUAL feet so the smear tracks the
-    // character exactly, at any zoom. Stride and footprint both grow as you
-    // zoom out (÷zoom), so a zoomed-out, larger-looking player leaves
-    // correspondingly larger, farther-apart steps.
+  // Small expanding rings spawned at the feet while swimming and moving —
+  // each grows from RIPPLE_MIN_RADIUS to RIPPLE_MAX_RADIUS over its life
+  // then vanishes. No ground pixels are touched; this is purely an overlay.
+  _updateRipples(dt) {
+    if (this.ripples.length) this.ripples = this.ripples.filter((r) => this.time - r.born < RIPPLE_LIFE);
+    if (!this.moving || !this.inWater()) {
+      this._lastRipplePos = null;
+      this._rippleDist = 0;
+      return;
+    }
     const fx = this.charX;
     const fy = this.visualFeetY();
-    if (this._lastTrailPos) {
-      this._trailDist += Math.hypot(fx - this._lastTrailPos.x, fy - this._lastTrailPos.y);
+    if (this._lastRipplePos) {
+      this._rippleDist += Math.hypot(fx - this._lastRipplePos.x, fy - this._lastRipplePos.y);
     }
-    this._lastTrailPos = { x: fx, y: fy };
-    if (this._trailDist < TRAIL_STEP / this.zoom) return;
-    this._trailDist = 0;
-    const code = this.tileAt(Math.floor(fx / TILE), Math.floor(fy / TILE));
-    const color = TRAIL_COLOR[code];
-    if (!color) return; // void / water / ice leave no mark (also handles swimming)
-    this.trails.push({ x: fx, y: fy, born: this.time, color, size: TRAIL_MARK_SIZE / this.zoom });
+    this._lastRipplePos = { x: fx, y: fy };
+    if (this._rippleDist < RIPPLE_STEP) return;
+    this._rippleDist = 0;
+    this.ripples.push({ x: fx, y: fy, born: this.time });
   }
 
   // Generic per-decor trample interaction: for every decor TYPE that opts
@@ -851,13 +846,12 @@ export class Engine {
     const pt = this._interactionPoint();
     const now = this.time;
 
-    // Pass 1 — detection only: sweep the lattice cells overlapping the dirt
-    // footprint. A decor counts as trampled when its BASE sits on a walked
-    // pixel — i.e. within the dirt radius (plus a touch of its own trunk
-    // width) — so the removal area matches the dirt exactly. Standing on
-    // one starts it sinking, or (if already mid-animation) just refreshes
-    // when it was last stood on.
-    const dirtR = this._dirtRadius();
+    // Pass 1 — detection only: sweep the lattice cells overlapping the
+    // footfall. A decor counts as trampled when its BASE sits on a walked
+    // pixel — i.e. within the trample radius (plus a touch of its own trunk
+    // width). Standing on one starts it sinking, or (if already
+    // mid-animation) just refreshes when it was last stood on.
+    const trampleR = this._trampleRadius();
     const nearNow = new Set();
     for (const codeKey of Object.keys(DECOR)) {
       const cfg = DECOR[codeKey];
@@ -866,12 +860,12 @@ export class Engine {
       const pitch = cfg.cell * TILE;
       const gx0 = Math.floor(pt.x / pitch);
       const gy0 = Math.floor(pt.y / pitch);
-      const reach = Math.max(1, Math.ceil((dirtR + cfg.w * 0.5) / pitch));
+      const reach = Math.max(1, Math.ceil((trampleR + cfg.w * 0.5) / pitch));
       for (let oy = -reach; oy <= reach; oy++) {
         for (let ox = -reach; ox <= reach; ox++) {
           const item = this.decorAt(codeNum, cfg, gx0 + ox, gy0 + oy);
           if (!item) continue;
-          if (Math.hypot(item.x - pt.x, item.y - pt.y) > dirtR + item.w * 0.15) continue;
+          if (Math.hypot(item.x - pt.x, item.y - pt.y) > trampleR + item.w * 0.15) continue;
           nearNow.add(item.key);
           const st = this.trample.get(item.key);
           if (!st || st.state === 'up') {
@@ -1243,24 +1237,31 @@ export class Engine {
       }
     }
 
-    // Footprint trail: recolor the ground PIXELS under the feet to churned
-    // earth — OPAQUE while the mark lives, then gone in an instant (marks
-    // past their life are dropped in _updateTrails; there is no fade). Each
-    // mark is a tile-quantized block so it reads as recolored terrain
-    // pixels (pixel-art look, not a smooth circle), drawn under everything
-    // else so it never covers decor or the player. Close spacing overlaps
-    // consecutive marks into a continuous drag.
-    if (this.trails.length) {
-      for (const t of this.trails) {
-        const half = t.size / 2;
-        const wx0 = Math.floor((t.x - half) / TILE) * TILE;
-        const wy0 = Math.floor((t.y - half) / TILE) * TILE;
-        const wx1 = Math.ceil((t.x + half) / TILE) * TILE;
-        const wy1 = Math.ceil((t.y + half) / TILE) * TILE;
-        const px = Math.round(sx(wx0));
-        const py = Math.round(sy(wy0));
-        ctx.fillStyle = t.color;
-        ctx.fillRect(px, py, Math.round(sx(wx1)) - px, Math.round(sy(wy1)) - py);
+    // Water ripples: recolor the water's pixels to white in an expanding ring
+    // at the feet while swimming — tile-quantized pixel blocks (pixel-art
+    // style), not a drawn circle. Only water tiles are recolored, fully opaque.
+    // Drawn under decor/the player like the old trail was.
+    if (this.ripples.length) {
+      ctx.fillStyle = '#f2fbff';
+      for (const r of this.ripples) {
+        const t = Math.min(1, (this.time - r.born) / RIPPLE_LIFE);
+        const radius = RIPPLE_MIN_RADIUS + (RIPPLE_MAX_RADIUS - RIPPLE_MIN_RADIUS) * t;
+        const txMin = Math.floor((r.x - radius - TILE) / TILE);
+        const txMax = Math.ceil((r.x + radius + TILE) / TILE);
+        const tyMin = Math.floor((r.y - radius - TILE) / TILE);
+        const tyMax = Math.ceil((r.y + radius + TILE) / TILE);
+        for (let ty = tyMin; ty <= tyMax; ty++) {
+          for (let tx = txMin; tx <= txMax; tx++) {
+            const cxw = (tx + 0.5) * TILE;
+            const cyw = (ty + 0.5) * TILE;
+            const dist = Math.hypot(cxw - r.x, cyw - r.y);
+            if (Math.abs(dist - radius) > TILE) continue;
+            if (!WATER.has(this.tileAt(tx, ty))) continue;
+            const px = Math.round(sx(tx * TILE));
+            const py = Math.round(sy(ty * TILE));
+            ctx.fillRect(px, py, Math.round(sx((tx + 1) * TILE)) - px, Math.round(sy((ty + 1) * TILE)) - py);
+          }
+        }
       }
     }
 
