@@ -8,9 +8,15 @@ The world is infinite, but you're bounded: you can only wander ~300 pixels into 
 
 Nine biomes grow from your commands: **grass** (green base), **desert** (tan, sparse cacti), **forest** (dense walk-through micro-trees with depth sorting), **savannah** (golden, acacia trees), **mountain** (gray rock, snow-capped peaks), **tundra** (snow; auto-freezes water into walkable ice), **river** (adjustable width, auto-connects nearby water), **lake** (small water blob), and **ocean** (huge swimmable water). Water sprites are distinct from land; borders blend organically except water/ice (crisp edges).
 
-### Commands & Confirmation
+### Wildlife (predator–prey)
 
-Type commands as natural language: `"create grass"`, `"carve a river"`, `"turn desert into forest"`. Append `/overwrite` anywhere in a command to force replacement without confirmation. Otherwise, when the AI decides an action would overwrite existing terrain, a glass popup asks for confirmation (Enter/yes to proceed, Backspace/Delete/no to cancel). Rivers may also first ask `"connect to nearby river?"` the same way. Prompting is locked while terrain animates.
+Toggle **animals** on and two little ecosystems come alive, each confined to its biome. **Savanna:** lions hunt zebras — a lion ambles and searches, then sprints when a zebra strays within reach; zebras graze with long pauses and bolt (faster than any lion) the moment one gets close, running until it's well clear. **Forest:** wolves hunt deer the same way, and roam in **packs** — wandering wolves that meet up travel together, peeling off only to chase their own prey. **Bears hunt the wolves:** one or two wolves flee a pursuing bear, but a pack of three or more turns and brawls it, after which two wolves and the bear fall and respawn elsewhere. Bears and deer ignore each other. Caught prey respawns elsewhere in its biome; animals that end up off their home biome (e.g. terrain repainted under them) despawn. Everything bounces as it moves, spawns on-screen, and appears in the shared world image. The whole sim is deliberately cheap — small capped herds updated on a coarse "think" tick with squared-distance math, not per-frame.
+
+Animals start **off**. Toggle them with the switch in the right-side wildlife panel, by asking the AI (`"add animals"`, `"remove the wildlife"`), or with the `/animal` function.
+
+### Commands, Functions & Confirmation
+
+Type commands as natural language: `"create grass"`, `"carve a river"`, `"turn desert into forest"`. A single command can ask for several features at once — `"a desert and an ocean together"` builds both. Type **`/`** in the bar to see the available **functions**: `/overwrite` (force new terrain to replace what exists), `/cloud` (toggle clouds), and `/animal` (toggle wildlife). Otherwise, when the AI decides an action would overwrite existing terrain, a glass popup asks for confirmation (Enter/yes to proceed, Backspace/Delete/no to cancel). Rivers may also first ask `"connect to nearby river?"` the same way. Prompting is locked while terrain animates.
 
 ### AI Awareness
 
@@ -34,7 +40,7 @@ Without an API key the server falls back to a simple offline keyword parser, so 
 
 ## Structure
 
-- `server/index.js` — Express server: POST `/api/terrain` forwards `{command, charX, charY, worldGrid, gridOriginX, gridOriginY}` to Gemini with system prompt in `server/systemPrompt.js`; sanitizes JSON reply and falls back to offline parsing on error.
-- `src/game/engine.js` — canvas engine: WASD movement, sprite animation, tile grid, seeded-noise blob growth, Catmull-Rom river carving, zoom, and undo stack (10 steps).
-- `src/App.jsx` — command bar, toast notifications, undo button, zoom controls, and server fetch.
-- `assets/` — character sprites; `assets/nature_pack/` — terrain sprites (tree, acacia, cactus, mountain, snowtree).
+- `server/index.js` — Express server: POST `/api/terrain` forwards `{command, charX, charY, map}` to Gemini with system prompt in `server/systemPrompt.js`; sanitizes the JSON reply (a single action or an array of them) and falls back to offline parsing on error.
+- `src/game/engine.js` — canvas engine: WASD movement, sprite animation, tile grid, seeded-noise blob growth, Catmull-Rom river carving, zoom, undo stack (10 steps), and the wildlife predator–prey sim.
+- `src/App.jsx` — command bar, `/` function menu, toast + transient tips, wildlife panel, undo/zoom/share controls, and server fetch.
+- `assets/` — character sprites; `assets/nature_pack/` — terrain sprites (tree, acacia, cactus, mountain, snowtree) and animals (`savanna/lion`, `savanna/zebra`, `forest/wolf`, `forest/deer`, `forest/bear`). Any PNG under `nature_pack/**` auto-loads, grouped by name.

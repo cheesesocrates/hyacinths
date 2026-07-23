@@ -27,6 +27,15 @@ const NORMAL_STYLE = {
   button: { paddingTop: 8, paddingBottom: 8, paddingLeft: 14, paddingRight: 14, fontSize: 14, borderRadius: 12 }
 };
 
+// Slash "functions" typed into the create bar. /overwrite is a modifier on a
+// terrain command; /cloud and /animal are standalone toggles. Typing "/" pops
+// the menu below the bar (see the slash-menu render) listing these.
+const SLASH_FUNCTIONS = [
+  { name: '/overwrite', desc: 'Force new terrain to replace whatever is already there' },
+  { name: '/cloud', desc: 'Toggle the drifting clouds on or off' },
+  { name: '/animal', desc: 'Toggle the wildlife (savanna + forest) on or off' }
+];
+
 // Would an ocean centered at (ed.centerX, ed.centerY) with ed.maxRadius bury
 // any land the player already built? Scans the near-map snapshot for a cell
 // within Euclidean reach that is neither empty void ('.') nor the player
@@ -68,16 +77,31 @@ export default function App() {
   // Questions the player must answer before terrain applies:
   // { data, steps: ['connect'?, 'overwrite'?] } — answered front to back.
   const [pending, setPending] = useState(null);
-  // Savanna wildlife: off at first. A sidebar slides in from the right to
-  // point players at the toggle; the create bar can flip it too (ed.animals).
+  // Wildlife + clouds are engine toggles mirrored into React so the sidebar
+  // switch, the /animal and /cloud functions, and the AI command all agree.
+  // Both start off.
   const [animalsOn, setAnimalsOn] = useState(false);
+  const [cloudsOn, setCloudsOn] = useState(false);
   const [wildlifeOpen, setWildlifeOpen] = useState(false);
+  // A one-shot tip that pops up and fades the first time a biome is shaped.
+  const [tip, setTip] = useState(null);
+  const tipTimer = useRef(null);
+  const tipShown = useRef(false);
 
-  // Single path for flipping the wildlife on/off, shared by the sidebar
-  // switch and the create-bar command so the UI and engine never disagree.
   const toggleAnimals = (on) => {
     setAnimalsOn(on);
     gameRef.current?.setAnimals(on);
+  };
+  const toggleClouds = (on) => {
+    setCloudsOn(on);
+    gameRef.current?.setClouds(on);
+  };
+
+  // Pops the transient tip; it slides in and clears itself after a beat.
+  const showTip = (text) => {
+    clearTimeout(tipTimer.current);
+    setTip(text);
+    tipTimer.current = setTimeout(() => setTip(null), 7000);
   };
 
   const showToast = (text, detail) => {
@@ -101,6 +125,7 @@ export default function App() {
   useEffect(() => () => {
     clearTimeout(toastTimer.current);
     clearInterval(settleTimer.current);
+    clearTimeout(tipTimer.current);
   }, []);
 
   // The wildlife sidebar announces itself shortly after load, sliding in from
@@ -207,42 +232,74 @@ export default function App() {
 
   const locked = busy || shaping || !!pending;
 
-  const applyNow = (data) => {
-    if (gameRef.current.applyEngineData(data)) watchUntilIdle();
+  // The confirm-questions an action needs before applying: rivers may ask to
+  // connect to nearby water; oceans/overwrites ask before burying existing
+  // land (unless /overwrite already forced it).
+  const buildSteps = (ed, mapSnap, forceOverwrite) => {
+    const steps = [];
+    if (ed.terrain === 'river' && ed.connect === 'ask') {
+      if (gameRef.current.hasRiverNear(ed.points)) steps.push('connect');
+      else ed.connect = true; // nothing nearby — moot either way
+    }
+    if (ed.terrain === 'ocean' && !forceOverwrite && oceanCoversBuiltLand(mapSnap, ed)) {
+      steps.push('oceanfill');
+    } else if (ed.overwrite && !forceOverwrite) {
+      steps.push('overwrite');
+    }
+    return steps;
   };
 
-  // Answer the current question. "connect" no just means a separate river
-  // and moves on; "overwrite" no cancels the whole generation.
+  // Applies a queue of terrain actions in order (one command can produce
+  // several — "a desert and an ocean"). An action needing a confirm parks the
+  // rest of the queue in `pending` to resume once answered; otherwise it
+  // applies straight away. When the queue drains, lock the UI until the
+  // animations settle.
+  const advance = (queue, mapSnap, forceOverwrite) => {
+    while (queue.length) {
+      const ed = queue.shift();
+      const steps = buildSteps(ed, mapSnap, forceOverwrite);
+      if (steps.length) {
+        setPending({ data: ed, steps, queue, mapSnap, forceOverwrite });
+        return;
+      }
+      gameRef.current.applyEngineData(ed);
+    }
+    watchUntilIdle();
+  };
+
+  // Answer the current question, then resume the rest of the queue. "connect"
+  // no means a separate river; "overwrite" no skips just this one feature.
   const answer = (yes) => {
     if (!pending) return;
+    const { mapSnap, forceOverwrite } = pending;
+    const queue = pending.queue || [];
     const [step, ...rest] = pending.steps;
     const data = { ...pending.data };
     if (step === 'connect') {
       data.connect = yes;
       if (rest.length) {
-        setPending({ data, steps: rest });
+        setPending({ ...pending, data, steps: rest });
         return;
       }
       setPending(null);
-      applyNow(data);
+      gameRef.current.applyEngineData(data);
+      advance(queue, mapSnap, forceOverwrite);
       return;
     }
     if (step === 'oceanfill') {
-      // Ocean is always created either way: yes overwrites (floods) the land
-      // in its path; no leaves every existing pixel untouched and fills only
-      // the empty void around it.
+      // Ocean is created either way: yes floods the land in its path; no leaves
+      // every existing pixel untouched, filling only the empty void around it.
       setPending(null);
       data.overwrite = yes;
-      applyNow(data);
+      gameRef.current.applyEngineData(data);
+      advance(queue, mapSnap, forceOverwrite);
       return;
     }
     // overwrite question
     setPending(null);
-    if (yes) {
-      applyNow(data);
-    } else {
-      showToast('Cancelled — nothing was overwritten.');
-    }
+    if (yes) gameRef.current.applyEngineData(data);
+    else showToast(queue.length ? 'Skipped that one — nothing overwritten.' : 'Cancelled — nothing was overwritten.');
+    advance(queue, mapSnap, forceOverwrite);
   };
 
   // While a question popup is open: Enter agrees, Backspace/Delete (or the
@@ -290,14 +347,39 @@ export default function App() {
       setStarted(true);
       collapseToNormal();
     }
-    // "/overwrite" anywhere in the message forces the new terrain to replace
-    // whatever already exists. It's stripped before the prompt reaches the AI.
-    const forceOverwrite = /(^|\s)\/overwrite(\s|$)/i.test(raw);
-    const text = raw.replace(/(^|\s)\/overwrite(\s|$)/gi, ' ').replace(/\s+/g, ' ').trim();
+
+    // Slash "functions": /overwrite modifies a terrain command; /cloud and
+    // /animal are standalone toggles handled right here (no AI round-trip).
+    // All slash tokens are stripped before the prompt reaches the AI.
+    const forceOverwrite = /(^|\s)\/overwrite(?=\s|$)/i.test(raw);
+    const toggleCloudCmd = /(^|\s)\/clouds?(?=\s|$)/i.test(raw);
+    const toggleAnimalCmd = /(^|\s)\/animals?(?=\s|$)/i.test(raw);
+    const text = raw
+      .replace(/(^|\s)\/(overwrite|clouds?|animals?)(?=\s|$)/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    // Fire the toggles now, computing each next state up front for the toast.
+    const toggleNotes = [];
+    if (toggleCloudCmd) {
+      const next = !cloudsOn;
+      toggleClouds(next);
+      toggleNotes.push(next ? 'clouds on' : 'clouds off');
+    }
+    if (toggleAnimalCmd) {
+      const next = !animalsOn;
+      toggleAnimals(next);
+      toggleNotes.push(next ? 'animals on' : 'animals off');
+    }
+
     if (!text) {
-      showToast('Add what to create, e.g. "/overwrite forest".');
+      // Pure slash command(s) — nothing for the AI to build.
+      if (toggleNotes.length) showToast(toggleNotes.join(' · '));
+      else showToast('Add what to create, e.g. "forest" or "/animal".');
+      setCommand('');
       return;
     }
+
     const { x, y } = gameRef.current.getCharTile();
     const mapSnap = gameRef.current.mapSnapshot();
     setBusy(true);
@@ -309,49 +391,32 @@ export default function App() {
       });
       const data = await res.json();
       if (data.debug) console.error('[terrain api]', data.debug);
-      const ed = data.engine_data;
-      if (forceOverwrite && ed) ed.overwrite = true;
       const note = data.notification || 'The land shifts quietly.';
-      // Clouds are a standalone toggle with no terrain involved — handle it
-      // before the "nothing to do" early-return below would otherwise
-      // swallow it.
-      if (ed && typeof ed.clouds === 'boolean') {
-        gameRef.current?.setClouds(ed.clouds);
+      // engine_data may be a single action or an array of them ("desert and
+      // ocean"). Pull out standalone toggles and apply them inline; keep the
+      // terrain actions for the apply queue.
+      const actions = (Array.isArray(data.engine_data) ? data.engine_data : [data.engine_data]).filter(Boolean);
+      const terrainActions = [];
+      for (const a of actions) {
+        if (forceOverwrite && a.terrain) a.overwrite = true;
+        if (typeof a.clouds === 'boolean') toggleClouds(a.clouds);
+        if (typeof a.animals === 'boolean') toggleAnimals(a.animals);
+        if (a.terrain) terrainActions.push(a);
       }
-      // Wildlife is a standalone toggle too — flip it (and reflect the state
-      // in the sidebar switch) before the "nothing to do" return below.
-      if (ed && typeof ed.animals === 'boolean') {
-        toggleAnimals(ed.animals);
-      }
-      if (!ed || !ed.terrain) {
+
+      if (!terrainActions.length) {
         showToast(note, data.debug);
         setCommand('');
         return;
       }
-      // Build the question chain: rivers with an unspecified "connect" ask
-      // about joining nearby water first; any overwrite the player didn't
-      // force with /overwrite asks before anything is destroyed.
-      const steps = [];
-      if (ed.terrain === 'river' && ed.connect === 'ask') {
-        if (gameRef.current.hasRiverNear(ed.points)) steps.push('connect');
-        else ed.connect = true; // nothing nearby — moot either way
-      }
-      // An ocean would otherwise silently flood existing land (the engine
-      // treats grass as a free base layer). When one would bury land the
-      // player built, ask "overwrite?": yes floods everything in its path,
-      // but no still places the ocean — only in empty (white) space, leaving
-      // every existing pixel untouched (see the 'oceanfill' case in answer).
-      if (ed.terrain === 'ocean' && !forceOverwrite && oceanCoversBuiltLand(mapSnap, ed)) {
-        steps.push('oceanfill');
-      } else if (ed.overwrite && !forceOverwrite) {
-        steps.push('overwrite');
-      }
+
       showToast(forceOverwrite ? note + ' (overwriting)' : note, data.debug);
-      if (steps.length) {
-        setPending({ data: ed, steps });
-      } else {
-        if (gameRef.current.applyEngineData(ed)) watchUntilIdle();
+      // First biome of the session → the one-shot tip about the wildlife.
+      if (!tipShown.current) {
+        tipShown.current = true;
+        showTip('Tip: you can spawn animals through the create bar too — try /animal, or type / to see every function.');
       }
+      advance(terrainActions, mapSnap, forceOverwrite);
       setCommand('');
     } catch {
       showToast('Could not reach the terrain server.');
@@ -408,6 +473,18 @@ export default function App() {
     }
   };
 
+  // The "/" menu shows while the current token is a slash query — typing "/"
+  // lists every function; "/cl" filters to /cloud, and so on.
+  const slashQuery = (() => {
+    const m = command.match(/(?:^|\s)(\/[a-z]*)$/i);
+    return m ? m[1].toLowerCase() : null;
+  })();
+  const slashMatches = slashQuery ? SLASH_FUNCTIONS.filter((f) => f.name.startsWith(slashQuery)) : [];
+  const pickSlash = (name) => {
+    setCommand((cur) => cur.replace(/(^|\s)(\/[a-z]*)$/i, (m, pre) => pre + name + ' '));
+    inputRef.current?.focus();
+  };
+
   return (
     <>
       <GameCanvas ref={gameRef} />
@@ -441,6 +518,25 @@ export default function App() {
             ↗
           </button>
         )}
+        {slashMatches.length > 0 && (
+          <div className="slash-menu">
+            {slashMatches.map((f) => (
+              // onMouseDown (not onClick) so the pick lands before the input blurs.
+              <button
+                type="button"
+                key={f.name}
+                className="slash-item"
+                onMouseDown={(ev) => {
+                  ev.preventDefault();
+                  pickSlash(f.name);
+                }}
+              >
+                <span className="slash-name">{f.name}</span>
+                <span className="slash-desc">{f.desc}</span>
+              </button>
+            ))}
+          </div>
+        )}
       </form>
       {pending && (
         <div className="confirm-pop">
@@ -465,6 +561,7 @@ export default function App() {
           {toast.detail && <div className="toast-detail">{toast.detail}</div>}
         </div>
       )}
+      {tip && <div className="game-tip">{tip}</div>}
       {!wildlifeOpen && (
         <button
           type="button"
@@ -473,13 +570,13 @@ export default function App() {
           title="Wildlife"
           aria-label="Show wildlife panel"
         >
-          🦓
+          🐾
         </button>
       )}
       <div className={wildlifeOpen ? 'wildlife-panel open' : 'wildlife-panel'}>
         <div className="wildlife-body">
           <div className="wildlife-head">
-            <span className="wildlife-title">Savanna wildlife</span>
+            <span className="wildlife-title">Wildlife</span>
             <button type="button" className="wildlife-close" onClick={() => setWildlifeOpen(false)} title="Hide">
               ×
             </button>
@@ -497,7 +594,10 @@ export default function App() {
             </span>
           </button>
           <p className="wildlife-hint">
-            Lions hunt and zebras bolt across the <b>savannah</b>. You can toggle animals through the create bar too.
+            Lions &amp; zebras roam the <b>savanna</b>; wolves, deer &amp; bears the <b>forest</b>. Toggle them here or through the create bar.
+          </p>
+          <p className="wildlife-hint">
+            Type <b>/</b> in the bar to view functions.
           </p>
         </div>
       </div>

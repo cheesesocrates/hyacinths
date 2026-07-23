@@ -184,23 +184,19 @@ async function askGroq(command, charX, charY, map) {
   return extractFirstJson(text);
 }
 
-// The model is instructed to return strict JSON, but the engine only ever
-// receives values that survive this clamp.
-function sanitize(raw, charX, charY) {
-  if (!raw || typeof raw !== 'object' || !raw.engine_data) return INVALID();
-  const notification = typeof raw.notification === 'string' ? raw.notification.slice(0, 200) : 'The land shifts.';
-  const ed = raw.engine_data;
+// Clamps ONE engine_data action from the model into exactly what the engine
+// accepts, or returns null if it's neither a supported terrain nor a toggle.
+// Shared by single- and multi-action responses (see sanitize).
+function sanitizeAction(ed, charX, charY) {
+  if (!ed || typeof ed !== 'object' || Array.isArray(ed)) return null;
   const terrain = TERRAINS.has(ed.terrain) ? ed.terrain : null;
   if (!terrain) {
-    // A pure toggle command (clouds or wildlife) has no terrain at all —
-    // don't let the generic INVALID() response swallow those flags.
+    // A pure toggle action (clouds or wildlife) carries no terrain at all.
     const toggles = {};
     if (typeof ed.clouds === 'boolean') toggles.clouds = ed.clouds;
     if (typeof ed.animals === 'boolean') toggles.animals = ed.animals;
-    if (Object.keys(toggles).length) {
-      return { notification, engine_data: { terrain: null, overwrite: false, ...toggles } };
-    }
-    return INVALID(notification);
+    if (Object.keys(toggles).length) return { terrain: null, overwrite: false, ...toggles };
+    return null;
   }
   const overwrite = ed.overwrite === true;
   const num = (v, fallback) => (Number.isFinite(Number(v)) ? Number(v) : fallback);
@@ -210,56 +206,65 @@ function sanitize(raw, charX, charY) {
       .map((p) => ({ x: Math.round(Number(p?.x)), y: Math.round(Number(p?.y)) }))
       .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y))
       .slice(0, 12);
-    if (points.length < 2) return INVALID(notification);
+    if (points.length < 2) return null;
     const connect = ed.connect === false ? false : ed.connect === true ? true : 'ask';
-    const overwrite = ed.overwrite === false ? false : true;
     const width = Math.min(5, Math.max(0.4, num(ed.width, 1)));
-    return { notification, engine_data: { terrain, points, overwrite, connect, width } };
+    return { terrain, points, overwrite: ed.overwrite === false ? false : true, connect, width };
   }
 
   if (terrain === 'lake') {
     return {
-      notification,
-      engine_data: {
-        terrain,
-        centerX: Math.round(num(ed.centerX, charX)),
-        centerY: Math.round(num(ed.centerY, charY)),
-        maxRadius: Math.min(60, Math.max(4, num(ed.maxRadius, 12))),
-        seed: num(ed.seed, Math.random() * 1000),
-        roughness: Math.min(0.8, Math.max(0.3, num(ed.roughness, 0.55))),
-        atRiverEnd: ed.atRiverEnd === true,
-        overwrite
-      }
+      terrain,
+      centerX: Math.round(num(ed.centerX, charX)),
+      centerY: Math.round(num(ed.centerY, charY)),
+      maxRadius: Math.min(60, Math.max(4, num(ed.maxRadius, 12))),
+      seed: num(ed.seed, Math.random() * 1000),
+      roughness: Math.min(0.8, Math.max(0.3, num(ed.roughness, 0.55))),
+      atRiverEnd: ed.atRiverEnd === true,
+      overwrite
     };
   }
 
   if (terrain === 'ocean') {
     return {
-      notification,
-      engine_data: {
-        terrain,
-        centerX: Math.round(num(ed.centerX, charX)),
-        centerY: Math.round(num(ed.centerY, charY)),
-        maxRadius: Math.min(140, Math.max(20, num(ed.maxRadius, 38))),
-        seed: num(ed.seed, Math.random() * 1000),
-        roughness: Math.min(0.8, Math.max(0.3, num(ed.roughness, 0.55))),
-        overwrite
-      }
+      terrain,
+      centerX: Math.round(num(ed.centerX, charX)),
+      centerY: Math.round(num(ed.centerY, charY)),
+      maxRadius: Math.min(140, Math.max(20, num(ed.maxRadius, 38))),
+      seed: num(ed.seed, Math.random() * 1000),
+      roughness: Math.min(0.8, Math.max(0.3, num(ed.roughness, 0.55))),
+      overwrite
     };
   }
 
   return {
-    notification,
-    engine_data: {
-      terrain,
-      centerX: Math.round(num(ed.centerX, charX)),
-      centerY: Math.round(num(ed.centerY, charY)),
-      maxRadius: Math.min(160, Math.max(5, num(ed.maxRadius, 40))),
-      seed: num(ed.seed, Math.random() * 1000),
-      roughness: Math.min(0.8, Math.max(0.3, num(ed.roughness, 0.55))),
-      overwrite
-    }
+    terrain,
+    centerX: Math.round(num(ed.centerX, charX)),
+    centerY: Math.round(num(ed.centerY, charY)),
+    maxRadius: Math.min(160, Math.max(5, num(ed.maxRadius, 40))),
+    seed: num(ed.seed, Math.random() * 1000),
+    roughness: Math.min(0.8, Math.max(0.3, num(ed.roughness, 0.55))),
+    overwrite
   };
+}
+
+// The model is instructed to return strict JSON, but the engine only ever
+// receives values that survive this clamp. engine_data may be a single action
+// object (as before) OR an array of them ("a desert and an ocean") — the
+// client accepts either shape.
+function sanitize(raw, charX, charY) {
+  if (!raw || typeof raw !== 'object' || !raw.engine_data) return INVALID();
+  const notification = typeof raw.notification === 'string' ? raw.notification.slice(0, 200) : 'The land shifts.';
+  const ed = raw.engine_data;
+  if (Array.isArray(ed)) {
+    const actions = ed.map((e) => sanitizeAction(e, charX, charY)).filter(Boolean).slice(0, 8);
+    if (!actions.length) return INVALID(notification);
+    // A single surviving action needn't stay wrapped.
+    return { notification, engine_data: actions.length === 1 ? actions[0] : actions };
+  }
+  const action = sanitizeAction(ed, charX, charY);
+  if (!action) return INVALID(notification);
+  return { notification, engine_data: action };
 }
 
 // Detects a relative direction ("left", "north", etc.) mentioned in the
@@ -291,6 +296,39 @@ function detectConnectState(text) {
   return 'ask';
 }
 
+// Builds one offline engine_data action for a terrain, fanned out by `idx` so
+// several features in one command don't stack on the same spot. Mirrors the
+// single-feature shapes the offline builders below produce.
+function offlineTerrainAction(terrain, charX, charY, text, dir, idx) {
+  const rnd = () => Math.random() * 1000;
+  const rough = () => 0.4 + Math.random() * 0.3;
+  let cx = charX + (dir ? dir.dx * 25 : 0);
+  let cy = charY + (dir ? dir.dy * 25 : 0);
+  if (idx > 0) {
+    const ang = idx * 2.2; // fan subsequent features around the player
+    const off = 34 + idx * 8;
+    cx += Math.round(Math.cos(ang) * off);
+    cy += Math.round(Math.sin(ang) * off);
+  }
+  const overwrite = /(turn|into|replace|overwrite|change|convert|instead)/.test(text);
+  if (terrain === 'river') {
+    const points = [];
+    let x = cx + Math.round((Math.random() - 0.5) * 8);
+    for (let i = 0; i < 7; i++) {
+      points.push({ x, y: cy - 21 + i * 7 });
+      x += Math.round((Math.random() - 0.5) * 9);
+    }
+    return { terrain, points, overwrite: true, connect: detectConnectState(text), width: 1 };
+  }
+  if (terrain === 'lake') {
+    return { terrain, centerX: cx, centerY: cy, maxRadius: 12, seed: rnd(), roughness: rough(), atRiverEnd: false, overwrite };
+  }
+  if (terrain === 'ocean') {
+    return { terrain, centerX: cx, centerY: cy, maxRadius: 38, seed: rnd(), roughness: rough(), overwrite };
+  }
+  return { terrain, centerX: cx, centerY: cy, maxRadius: 40, seed: rnd(), roughness: rough(), overwrite };
+}
+
 // Keyword parser used when no API key is configured or every provider is
 // down, so the game stays playable offline. Picks the LAST terrain
 // mentioned, so "turn desert into forest" resolves to forest.
@@ -310,12 +348,12 @@ function offlineFallback(command, charX, charY, apiFailed, debug) {
     return result;
   }
 
-  // Savanna wildlife is a standalone toggle too — same short-circuit as
-  // clouds, before the terrain scan (so "animals" never reads as a biome).
-  if (/\b(animals?|wildlife|lions?|zebras?|predators?|prey)\b/i.test(text)) {
+  // Wildlife is a standalone toggle too — same short-circuit as clouds, before
+  // the terrain scan (so an animal word never reads as a biome).
+  if (/\b(animals?|wildlife|lions?|zebras?|wolf|wolves|bears?|deers?|predators?|prey)\b/i.test(text)) {
     const animalsOff = /\b(remove|hide|clear|off|no|stop|disable|kill|without)\b/i.test(text);
     const result = {
-      notification: (animalsOff ? 'The savanna wildlife wanders off.' : 'Lions and zebras roam the savanna.') + suffix,
+      notification: (animalsOff ? 'The wildlife wanders off.' : 'Wildlife roams the savanna and forest.') + suffix,
       engine_data: { terrain: null, overwrite: false, animals: !animalsOff }
     };
     if (debug) result.debug = debug;
@@ -333,6 +371,33 @@ function offlineFallback(command, charX, charY, apiFailed, debug) {
     savannah: ['savannah', 'savanna', 'acacia'],
     mountain: ['mountain', 'mountains', 'rocky', 'peak', 'cliff']
   };
+
+  // Multiple features in one breath ("a desert and an ocean together"): only
+  // when the phrasing joins them ("and"/comma/plus) AND isn't a transformation
+  // ("turn X into Y" is a single overwrite, not two features). Build one action
+  // per distinct terrain, fanned out so they don't stack on the same spot.
+  const joined = /\band\b|,|\bplus\b|&|\bwith\b|\bthen\b/.test(text);
+  const transform = /(turn|into|replace|overwrite|convert|instead)/.test(text);
+  if (joined && !transform) {
+    const found = [];
+    for (const [name, words] of Object.entries(synonyms)) {
+      let idx = Infinity;
+      for (const w of words) {
+        const i = text.indexOf(w);
+        if (i >= 0 && i < idx) idx = i;
+      }
+      if (idx !== Infinity) found.push({ name, idx });
+    }
+    if (found.length >= 2) {
+      found.sort((a, b) => a.idx - b.idx);
+      const dir = detectDirection(text);
+      const actions = found.map((f, i) => offlineTerrainAction(f.name, charX, charY, text, dir, i));
+      const result = { notification: `Shaping ${found.map((f) => f.name).join(' and ')} together.` + suffix, engine_data: actions };
+      if (debug) result.debug = debug;
+      return result;
+    }
+  }
+
   let terrain = null;
   let bestIdx = -1;
   for (const [name, words] of Object.entries(synonyms)) {

@@ -111,59 +111,62 @@ const CLOUD_WIND = { x: Math.cos(0.18), y: Math.sin(0.18) };
 const CLOUD_BOB_AMP = 3; // screen px of vertical jiggle
 const CLOUD_BOB_RATE = 5.5; // how fast the jiggle steps
 
-// ── Predator–prey wildlife (savanna) ──────────────────────────────────
-// Lions hunt; zebras graze and bolt. The whole sim is deliberately cheap:
-// populations are small and capped, targets are re-evaluated only on a
-// coarse "think" tick (not every frame), and that tick compares SQUARED
-// distances in a single shared lion×zebra pass — so per frame it's just a
-// handful of moves with no sqrt-heavy neighbour search. Off until the player
-// toggles it on (the create bar or the wildlife sidebar).
+// ── Wildlife: predator–prey ecosystems (savanna + forest) ─────────────
+// Savanna: lions hunt zebras. Forest: wolves hunt deer, and react to bears —
+// one or two wolves flee a bear, but three or more gang up and brawl it. The
+// whole sim is deliberately cheap: small capped populations held in ONE flat
+// array, targets re-evaluated only on a coarse "think" tick (not every
+// frame) using SQUARED distances, and off entirely until toggled on.
 const TAU = Math.PI * 2;
-const ANIMAL_SPAWN_CHECK = 1.0; // seconds between spawn attempts
-const ANIMAL_THINK = 0.2; // seconds between AI target re-evaluations
-const MAX_LIONS = 4;
-const MAX_ZEBRAS = 9;
-const ANIMAL_SPAWN_MIN = 160; // ring (world px) around the player they appear in
-const ANIMAL_SPAWN_MAX = 620;
-const ANIMAL_DESPAWN_DIST = 1500; // culled past this from the player
-
-const LION_SIGHT = 260; // a lion chases prey within this — its "reach"
-const ZEBRA_SIGHT = LION_SIGHT / 2; // a zebra only notices a lion at half that range…
-const ZEBRA_SAFE = LION_SIGHT; // …then keeps bolting until the lion is past its full reach (hysteresis)
-
-const LION_WANDER_SPEED = 42; // px/s ambling & searching
-const LION_CHASE_SPEED = 132; // px/s sprinting after prey
-const ZEBRA_WANDER_SPEED = 52; // grazing drift — already a touch quicker than a lion's amble
-const ZEBRA_FLEE_SPEED = 170; // faster than a charging lion, so a zebra can pull away and escape
+const ANIMAL_SPAWN_CHECK = 1.0; // seconds between spawn/cull passes
+const ANIMAL_THINK = 0.2; // seconds between AI re-evaluations
+const ANIMAL_CULL_MARGIN = 500; // px beyond the view's half-diagonal before an animal is culled
+const ANIMAL_CATCH = 15; // a hunter within this of its prey catches it (prey then respawns elsewhere)
 
 const ANIMAL_BOUNCE = 5; // base hop height (world px) — animals bob rather than glide
 const ANIMAL_RUN_BOUNCE = 1.8; // hop grows by this factor while running
 const ANIMAL_BOUNCE_RATE = 0.16; // hop cadence per unit of travel (faster gait → quicker patter)
-const ANIMAL_DRAW_PAD = 40; // viewport cull margin for drawing (≥ the biggest animal)
+const ANIMAL_DRAW_PAD = 44; // viewport cull margin for drawing (≥ the biggest animal)
 
-// Per-kind behaviour profile shared by every instance of that animal. Wander
-// alternates short random moves with pauses: zebras pause OFTEN and LONG
-// (heads-down grazing), lions pause RARELY and BRIEFLY (restless hunters).
-// `flee` turns a chase into a run-away; wanderSpeed/runSpeed are the slow
-// amble vs the fast chase/flee sprint.
-const LION_PROFILE = {
-  pool: 'lion',
-  size: 34,
-  flee: false,
-  wanderSpeed: LION_WANDER_SPEED,
-  runSpeed: LION_CHASE_SPEED,
-  moveTime: [0.7, 1.6],
-  pauseTime: [0.15, 0.5]
+// When a straight run is blocked by a biome/world edge, veer by these angles
+// (radians, small first) to slip along the boundary and out of corners
+// instead of sticking — so a chase barely wavers before resuming.
+const ANIMAL_DEFLECT = [0.5, -0.5, 1.0, -1.0, 1.6, -1.6, 2.2, -2.2, 2.8, -2.8];
+
+// Forest wolf-vs-bear rules.
+const WOLF_BEAR_ALERT = 210; // a wolf reacts to a bear within this
+const WOLF_BEAR_SAFE = 300; // …and an outnumbered wolf keeps fleeing until the bear is past this
+const BEAR_SIGHT = 240; // a bear chases the nearest wolf within this (unless a pack is swarming it)
+const WOLF_PACK_RADIUS = 175; // wolves this close count as one pack (bear tally + flock cohesion)
+const WOLF_FIGHT_RADIUS = 62; // "in melee" range that starts/sustains a brawl
+const WOLF_FIGHT_PACK = 3; // 3+ wolves fight the bear instead of fleeing it
+const FIGHT_FIRST_KILL = 0.8; // seconds into a brawl the first wolf falls
+const FIGHT_END = 1.7; // …then a second wolf and the bear fall — all three respawn elsewhere
+
+// Wolf packs: idle wolves stay bunched — each wanders freely within a leash of
+// the group's centre and is steered back when it strays past it (with a little
+// separation so they don't pile up), so a settled pack drifts together. A wolf
+// chasing prey or fleeing a bear ignores all this and peels off on its own.
+const WOLF_PACK_LEASH = 64; // a wolf drifting this far from its packmates' centre is drawn back
+const WOLF_PACK_SEPARATION = 44; // …but packmates still keep at least this much space
+const WOLF_PACK_STEER = 0.09; // how firmly a strayed wolf turns back toward its pack each frame
+
+// Per-species behaviour, shared by every instance. biome = the only terrain
+// it lives on (leaving it despawns the animal). role drives the think tick.
+// wander/run are the slow amble vs the fast chase/flee sprint. sight is the
+// detection radius; prey also carry `safe`, the larger distance a fleer
+// relaxes at (hysteresis). moveTime/pauseTime frame the wander gait — prey
+// pause OFTEN and LONG (grazing), hunters pause RARELY and BRIEFLY.
+const PROFILES = {
+  lion: { pool: 'lion', biome: TERRAIN.SAVANNAH, size: 34, wander: 42, run: 132, moveTime: [0.7, 1.6], pauseTime: [0.15, 0.5], role: 'hunter', prey: 'zebra', sight: 260 },
+  zebra: { pool: 'zebra', biome: TERRAIN.SAVANNAH, size: 30, wander: 52, run: 170, moveTime: [0.6, 1.3], pauseTime: [0.8, 2.2], role: 'prey', pred: 'lion', sight: 130, safe: 260 },
+  wolf: { pool: 'wolf', biome: TERRAIN.FOREST, size: 27, wander: 50, run: 152, moveTime: [0.6, 1.4], pauseTime: [0.25, 0.7], role: 'wolf', prey: 'deer', sight: 250 },
+  deer: { pool: 'deer', biome: TERRAIN.FOREST, size: 30, wander: 54, run: 176, moveTime: [0.6, 1.3], pauseTime: [0.7, 2.0], role: 'prey', pred: 'wolf', sight: 125, safe: 250 },
+  bear: { pool: 'bear', biome: TERRAIN.FOREST, size: 37, wander: 38, run: 118, moveTime: [0.8, 1.7], pauseTime: [0.5, 1.1], role: 'bear' }
 };
-const ZEBRA_PROFILE = {
-  pool: 'zebra',
-  size: 30,
-  flee: true,
-  wanderSpeed: ZEBRA_WANDER_SPEED,
-  runSpeed: ZEBRA_FLEE_SPEED,
-  moveTime: [0.6, 1.3],
-  pauseTime: [0.8, 2.2]
-};
+
+// Per-kind population caps (≥3 wolves so a bear brawl is possible).
+const ANIMAL_CAPS = { lion: 4, zebra: 9, wolf: 6, deer: 7, bear: 2 };
 
 function randRange(range) {
   return range[0] + Math.random() * (range[1] - range[0]);
@@ -393,12 +396,14 @@ export class Engine {
     this._twSpawnT = 0;
     this.clouds = [];
     this.cloudsOn = false;
-    // Predator–prey wildlife — empty and off until toggled on.
-    this.lions = [];
-    this.zebras = [];
+    // Predator–prey wildlife — one flat array of all species, off until
+    // toggled on. _animalsDirty defers the removal filter to frames where
+    // something actually died/left its biome.
+    this.animals = [];
     this.animalsOn = false;
     this._animSpawnT = 0;
     this._animThinkT = 0;
+    this._animalsDirty = false;
     this.resize(window.innerWidth, window.innerHeight);
   }
 
@@ -1098,55 +1103,85 @@ export class Engine {
     else this.clouds = [];
   }
 
-  // Toggles the savanna wildlife. On starts the spawn/think loop (animals
-  // fade in on nearby savannah); off clears the herds at once. Mirrors
-  // setClouds — the create bar (AI `animals` flag) and the wildlife sidebar
-  // both route through here.
+  // Toggles all wildlife. On starts the spawn/think loop (animals fade in on
+  // nearby savanna and forest); off clears every herd at once. Mirrors
+  // setClouds — the create bar (AI `animals` flag / the /animal function) and
+  // the wildlife sidebar both route through here.
   setAnimals(on) {
     this.animalsOn = !!on;
-    if (!this.animalsOn) {
-      this.lions = [];
-      this.zebras = [];
+    if (this.animalsOn) {
+      this._animSpawnT = ANIMAL_SPAWN_CHECK; // spawn a first batch on the very next frame
+      this._animThinkT = 0;
+    } else {
+      this.animals = [];
       this._animSpawnT = 0;
       this._animThinkT = 0;
+      this._animalsDirty = false;
     }
   }
 
   _updateAnimals(dt) {
     this._spawnAnimals(dt);
     this._thinkAnimals(dt);
-    for (const l of this.lions) this._stepAnimal(l, dt, l.target);
-    for (const z of this.zebras) this._stepAnimal(z, dt, z.threat);
+    for (const a of this.animals) if (!a.dead) this._stepAnimal(a, dt);
+    // One removal pass, only on frames where something died or left its biome.
+    if (this._animalsDirty) {
+      this.animals = this.animals.filter((a) => !a.dead);
+      this._animalsDirty = false;
+    }
   }
 
-  // Population upkeep runs only on the spawn tick (not every frame): top the
-  // herds up toward their caps on nearby savannah, then cull anything that
-  // has fallen far behind the wandering player.
+  // The player's current view rectangle in world px — animals spawn inside it
+  // (on-screen, not just near the player) and are culled once well outside it,
+  // so the visible population scales naturally with zoom.
+  _viewRect() {
+    const viewW = this.canvas.width / this.zoom;
+    const viewH = this.canvas.height / this.zoom;
+    return { camX: this.charX - viewW / 2, camY: this.charY - viewH / 2, viewW, viewH };
+  }
+
+  // A random on-screen point that sits on the given biome, or null if a few
+  // tries all miss (that biome isn't visible right now). Shared by spawning
+  // and by respawn-elsewhere (caught prey, brawl casualties).
+  _findSpawnSpot(biome) {
+    const { camX, camY, viewW, viewH } = this._viewRect();
+    for (let i = 0; i < 8; i++) {
+      const x = camX + Math.random() * viewW;
+      const y = camY + Math.random() * viewH;
+      if (this.tileAt(Math.floor(x / TILE), Math.floor(y / TILE)) === biome) return { x, y };
+    }
+    return null;
+  }
+
+  // Population upkeep, only on the spawn tick (not every frame): top each
+  // species up toward its cap on-screen, then cull anything far off-screen.
   _spawnAnimals(dt) {
     this._animSpawnT += dt;
     if (this._animSpawnT < ANIMAL_SPAWN_CHECK) return;
     this._animSpawnT = 0;
-    if (this.lions.length < MAX_LIONS) this._trySpawn(this.lions, LION_PROFILE);
-    // Prey outnumber predators, so make two attempts at a zebra per tick.
-    if (this.zebras.length < MAX_ZEBRAS) this._trySpawn(this.zebras, ZEBRA_PROFILE);
-    if (this.zebras.length < MAX_ZEBRAS) this._trySpawn(this.zebras, ZEBRA_PROFILE);
+    const counts = {};
+    for (const a of this.animals) counts[a.kind] = (counts[a.kind] || 0) + 1;
+    for (const kind in ANIMAL_CAPS) {
+      const deficit = ANIMAL_CAPS[kind] - (counts[kind] || 0);
+      // Ramp up gently — at most two of a kind per tick — so herds fade in.
+      for (let n = Math.min(2, deficit); n > 0; n--) this._trySpawn(kind);
+    }
     this._cullAnimals();
   }
 
-  // One spawn attempt at a random spot in a ring around the player; it takes
-  // only if that spot is savannah, so herds exist exactly where their biome
-  // does and nowhere else.
-  _trySpawn(arr, prof) {
-    const ang = Math.random() * TAU;
-    const dist = ANIMAL_SPAWN_MIN + Math.random() * (ANIMAL_SPAWN_MAX - ANIMAL_SPAWN_MIN);
-    const x = this.charX + Math.cos(ang) * dist;
-    const y = this.charY + Math.sin(ang) * dist;
-    if (this.tileAt(Math.floor(x / TILE), Math.floor(y / TILE)) !== TERRAIN.SAVANNAH) return;
+  // One spawn attempt for `kind` at an on-screen spot on its home biome. Fails
+  // silently (retried next tick) when that biome isn't visible, so herds exist
+  // exactly where their biome does and nowhere else.
+  _trySpawn(kind) {
+    const prof = PROFILES[kind];
+    const spot = this._findSpawnSpot(prof.biome);
+    if (!spot) return;
     const heading = Math.random() * TAU;
-    arr.push({
-      x,
-      y,
+    this.animals.push({
+      kind,
       prof,
+      x: spot.x,
+      y: spot.y,
       dx: Math.cos(heading),
       dy: Math.sin(heading),
       paused: false,
@@ -1157,121 +1192,330 @@ export class Engine {
       variant: Math.floor(Math.random() * 997),
       target: null,
       threat: null,
-      fleeing: false
+      fleeing: false,
+      fleeBear: false,
+      fighting: false,
+      fightT: 0,
+      killed1: false
     });
   }
 
+  // Moves an animal to a fresh on-screen spot on its biome and resets its
+  // behaviour — this is "respawn somewhere else" for caught prey and for the
+  // brawl's casualties. If its biome isn't visible, it simply despawns.
+  _relocate(a) {
+    const spot = this._findSpawnSpot(a.prof.biome);
+    if (!spot) {
+      a.dead = true;
+      this._animalsDirty = true;
+      return;
+    }
+    a.x = spot.x;
+    a.y = spot.y;
+    a.paused = false;
+    a.running = false;
+    a.stateT = 0;
+    a.bobPhase = Math.random() * TAU;
+    a.target = null;
+    a.threat = null;
+    a.fleeing = false;
+    a.fleeBear = false;
+    a.fighting = false;
+    a.fightT = 0;
+    a.killed1 = false;
+    const h = Math.random() * TAU;
+    a.dx = Math.cos(h);
+    a.dy = Math.sin(h);
+  }
+
   _cullAnimals() {
-    const far = ANIMAL_DESPAWN_DIST * ANIMAL_DESPAWN_DIST;
-    const near = (a) => {
+    const { viewW, viewH } = this._viewRect();
+    const cullR = Math.hypot(viewW, viewH) * 0.5 + ANIMAL_CULL_MARGIN;
+    const cull2 = cullR * cullR;
+    for (const a of this.animals) {
       const dx = a.x - this.charX;
       const dy = a.y - this.charY;
-      return dx * dx + dy * dy < far;
-    };
-    const beforeL = this.lions.length;
-    const beforeZ = this.zebras.length;
-    this.lions = this.lions.filter(near);
-    this.zebras = this.zebras.filter(near);
-    // Drop any target/threat pointing at an animal that was just culled so no
-    // one chases (or flees) a ghost in the gap before the next think tick.
-    if (this.zebras.length !== beforeZ) {
-      const alive = new Set(this.zebras);
-      for (const l of this.lions) if (l.target && !alive.has(l.target)) l.target = null;
-    }
-    if (this.lions.length !== beforeL) {
-      const alive = new Set(this.lions);
-      for (const z of this.zebras) {
-        if (z.threat && !alive.has(z.threat)) {
-          z.threat = null;
-          z.fleeing = false;
-        }
+      if (dx * dx + dy * dy > cull2) {
+        a.dead = true;
+        this._animalsDirty = true;
       }
     }
   }
 
-  // Coarse AI tick: every ANIMAL_THINK seconds decide who is chasing/fleeing
-  // whom. A SINGLE pass over the lion×zebra pairs finds — using squared
-  // distances only, no sqrt — each lion's nearest zebra AND each zebra's
-  // nearest lion at once. So the sim's one quadratic step runs a few times a
-  // second over a tiny population, never per frame.
+  // Coarse AI tick: every ANIMAL_THINK seconds re-decide who chases/flees/fights
+  // whom. Runs a few times a second over a tiny population, never per frame.
+  // First buckets by species (and despawns any that left their biome), then
+  // resolves each relationship with a shared squared-distance pass.
   _thinkAnimals(dt) {
     this._animThinkT -= dt;
     if (this._animThinkT > 0) return;
     this._animThinkT = ANIMAL_THINK;
-    const lions = this.lions;
-    const zebras = this.zebras;
-    // No predators or no prey → nothing to hunt; everyone just wanders.
-    if (!lions.length || !zebras.length) {
-      for (const l of lions) l.target = null;
-      for (const z of zebras) {
-        z.threat = null;
-        z.fleeing = false;
+
+    const lions = [];
+    const zebras = [];
+    const wolves = [];
+    const deer = [];
+    const bears = [];
+    for (const a of this.animals) {
+      if (a.dead) continue;
+      // An animal standing off its home biome (e.g. the ground was repainted
+      // under it) doesn't belong — it despawns.
+      if (this.tileAt(Math.floor(a.x / TILE), Math.floor(a.y / TILE)) !== a.prof.biome) {
+        a.dead = true;
+        this._animalsDirty = true;
+        continue;
       }
-      return;
+      switch (a.kind) {
+        case 'lion': lions.push(a); break;
+        case 'zebra': zebras.push(a); break;
+        case 'wolf': wolves.push(a); break;
+        case 'deer': deer.push(a); break;
+        case 'bear': bears.push(a); break;
+      }
     }
-    for (const l of lions) {
-      l._nz = null;
-      l._nd2 = Infinity;
-    }
-    for (const z of zebras) {
-      z._nl = null;
-      z._nd2 = Infinity;
-    }
-    for (const l of lions) {
-      for (const z of zebras) {
-        const dx = z.x - l.x;
-        const dy = z.y - l.y;
+
+    this._huntThink(lions, zebras); // savanna: lions ⇢ zebras
+    this._huntThink(wolves, deer); // forest: wolves ⇢ deer
+    this._bearThink(wolves, bears); // forest: wolves vs bears, and bears hunt wolves (may override the above)
+    this._packThink(wolves); // forest: idle wolves flock into a travelling pack
+  }
+
+  // Wolf-pack cohesion for the wolves NOT chasing prey or fleeing a bear (those
+  // peel off on their own — the "split apart" case). Each idle wolf checks its
+  // packmates within pack radius: if it has drifted past the leash from their
+  // centre it gets a `packDir` back toward the group, and it backs off any
+  // packmate crowding it. Otherwise packDir stays null and it wanders freely —
+  // so a settled pack stays bunched and drifts together. Tiny N (≤ cap²).
+  _packThink(wolves) {
+    const r2 = WOLF_PACK_RADIUS * WOLF_PACK_RADIUS;
+    const sep2 = WOLF_PACK_SEPARATION * WOLF_PACK_SEPARATION;
+    for (const w of wolves) {
+      w.packDir = null;
+      if (w.target || w.threat) continue; // pursuing/fleeing → free to split off
+      let sumX = 0;
+      let sumY = 0;
+      let n = 0;
+      let sepX = 0;
+      let sepY = 0;
+      for (const o of wolves) {
+        if (o === w) continue;
+        const dx = o.x - w.x;
+        const dy = o.y - w.y;
         const d2 = dx * dx + dy * dy;
-        if (d2 < l._nd2) {
-          l._nd2 = d2;
-          l._nz = z;
-        }
-        if (d2 < z._nd2) {
-          z._nd2 = d2;
-          z._nl = l;
+        if (d2 > r2) continue;
+        sumX += o.x;
+        sumY += o.y;
+        n++;
+        if (d2 < sep2) {
+          const d = Math.sqrt(d2) || 1;
+          sepX -= dx / d; // push away from a crowder
+          sepY -= dy / d;
         }
       }
-    }
-    // Lions lock onto the nearest zebra inside their sight radius.
-    const sight2 = LION_SIGHT * LION_SIGHT;
-    for (const l of lions) l.target = l._nd2 <= sight2 ? l._nz : null;
-    // Zebras bolt once a lion breaches half-sight and keep running until the
-    // nearest lion is past the lion's full reach — a hysteresis band so they
-    // don't flicker on and off right at the boundary.
-    const trigger2 = ZEBRA_SIGHT * ZEBRA_SIGHT;
-    const safe2 = ZEBRA_SAFE * ZEBRA_SAFE;
-    for (const z of zebras) {
-      if (z.fleeing) {
-        if (z._nd2 > safe2) z.fleeing = false;
-      } else if (z._nd2 <= trigger2) {
-        z.fleeing = true;
+      if (!n) continue;
+      let vx = sepX;
+      let vy = sepY;
+      // Cohesion: only once beyond the leash from the packmates' centre.
+      const cx = sumX / n - w.x;
+      const cy = sumY / n - w.y;
+      const cd = Math.hypot(cx, cy);
+      if (cd > WOLF_PACK_LEASH) {
+        vx += cx / cd;
+        vy += cy / cd;
       }
-      z.threat = z.fleeing ? z._nl : null;
+      const l = Math.hypot(vx, vy);
+      if (l > 0.0001) w.packDir = { x: vx / l, y: vy / l };
     }
   }
 
-  // Per-frame motion for one animal. `prey` is what it's reacting to: a lion's
-  // target zebra (run toward) or a zebra's threat lion (run away). With none,
-  // it wanders — alternating short random moves and pauses at the slow gait.
-  // Only running animals recompute a heading (one sqrt) each frame; wanderers
-  // reuse their fixed heading, so the common case stays cheap.
-  _stepAnimal(a, dt, prey) {
+  // Generic hunter⇢prey resolution: one shared pass finds each hunter's nearest
+  // prey and each prey's nearest hunter at once (squared distances, no sqrt).
+  // Hunters lock onto prey inside their sight; prey bolt inside their (smaller)
+  // sight and keep bolting until the hunter is past `safe` — a hysteresis band.
+  _huntThink(preds, preys) {
+    for (const p of preds) {
+      p.target = null;
+      p._near = null;
+      p._nd2 = Infinity;
+    }
+    for (const q of preys) {
+      q._near = null;
+      q._nd2 = Infinity;
+    }
+    if (preds.length && preys.length) {
+      for (const p of preds) {
+        for (const q of preys) {
+          const dx = q.x - p.x;
+          const dy = q.y - p.y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < p._nd2) {
+            p._nd2 = d2;
+            p._near = q;
+          }
+          if (d2 < q._nd2) {
+            q._nd2 = d2;
+            q._near = p;
+          }
+        }
+      }
+    }
+    for (const p of preds) {
+      const sight2 = p.prof.sight * p.prof.sight;
+      p.target = p._near && p._nd2 <= sight2 ? p._near : null;
+    }
+    for (const q of preys) {
+      const trig2 = q.prof.sight * q.prof.sight;
+      const safe2 = q.prof.safe * q.prof.safe;
+      if (q.fleeing) {
+        if (!q._near || q._nd2 > safe2) q.fleeing = false;
+      } else if (q._near && q._nd2 <= trig2) {
+        q.fleeing = true;
+      }
+      q.threat = q.fleeing ? q._near : null;
+    }
+  }
+
+  // Wolf⇢bear relationship, applied AFTER wolves have picked a deer to hunt so
+  // it can override that: one or two wolves near a bear flee it; three or more
+  // form a pack and brawl it. A brawl runs on a short timer — partway one wolf
+  // falls, at the end a second wolf and the bear fall, and all three respawn
+  // elsewhere in the forest ("die" = relocate). Bears ignore deer entirely.
+  _bearThink(wolves, bears) {
+    if (!bears.length) {
+      for (const w of wolves) {
+        w.threat = null;
+        w.fleeBear = false;
+        if (w.target && w.target.kind === 'bear') w.target = null;
+      }
+      return;
+    }
+    // One shared pass: each wolf's nearest bear AND each bear's nearest wolf,
+    // plus each bear's pack (near) and melee (close) wolf tally.
+    for (const b of bears) {
+      b._pack = 0;
+      b._melee = 0;
+      b._nw = null;
+      b._nwd2 = Infinity;
+    }
+    const pack2 = WOLF_PACK_RADIUS * WOLF_PACK_RADIUS;
+    const melee2 = WOLF_FIGHT_RADIUS * WOLF_FIGHT_RADIUS;
+    for (const w of wolves) {
+      let nb = null;
+      let nd2 = Infinity;
+      for (const b of bears) {
+        const dx = b.x - w.x;
+        const dy = b.y - w.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < nd2) {
+          nd2 = d2;
+          nb = b;
+        }
+        if (d2 < b._nwd2) {
+          b._nwd2 = d2;
+          b._nw = w;
+        }
+      }
+      w._bear = nb;
+      w._bd2 = nd2;
+      if (nb && nd2 <= pack2) nb._pack++;
+      if (nb && nd2 <= melee2) nb._melee++;
+    }
+    // Each wolf's response to its nearest bear (overriding any deer target).
+    const alert2 = WOLF_BEAR_ALERT * WOLF_BEAR_ALERT;
+    const safe2 = WOLF_BEAR_SAFE * WOLF_BEAR_SAFE;
+    for (const w of wolves) {
+      const b = w._bear;
+      if (w.target && w.target.kind === 'bear') w.target = null;
+      w.threat = null;
+      if (!b) {
+        w.fleeBear = false;
+        continue;
+      }
+      if (b._pack >= WOLF_FIGHT_PACK || b.fighting) {
+        // The pack is big enough (or already committed) — close in and brawl.
+        w.fleeBear = false;
+        if (w._bd2 <= alert2 || b.fighting) w.target = b;
+      } else {
+        // Outnumbered (one or two) — flee the bear, with hysteresis.
+        if (w.fleeBear) {
+          if (w._bd2 > safe2) w.fleeBear = false;
+        } else if (w._bd2 <= alert2) {
+          w.fleeBear = true;
+        }
+        if (w.fleeBear) w.threat = b;
+      }
+    }
+    // Bears run down the nearest wolf they can see — unless a pack of three or
+    // more is on them, in which case they stop and get swarmed into a brawl.
+    const bearSight2 = BEAR_SIGHT * BEAR_SIGHT;
+    for (const b of bears) {
+      b.target = !b.fighting && b._pack < WOLF_FIGHT_PACK && b._nw && b._nwd2 <= bearSight2 ? b._nw : null;
+    }
+    // Resolve brawls on the fight timer.
+    for (const b of bears) {
+      if (b._melee >= WOLF_FIGHT_PACK) b.fighting = true; // 3+ in melee latches the brawl
+      if (!b.fighting) continue;
+      b.fightT += ANIMAL_THINK;
+      if (!b.killed1 && b.fightT >= FIGHT_FIRST_KILL) {
+        b.killed1 = true;
+        this._relocateNearestWolf(wolves, b);
+      }
+      if (b.fightT >= FIGHT_END) {
+        this._relocateNearestWolf(wolves, b); // the second wolf
+        this._relocate(b); // and the bear
+        b.fighting = false;
+        b.fightT = 0;
+        b.killed1 = false;
+      }
+    }
+  }
+
+  _relocateNearestWolf(wolves, bear) {
+    let best = null;
+    let bd2 = Infinity;
+    for (const w of wolves) {
+      const dx = w.x - bear.x;
+      const dy = w.y - bear.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bd2) {
+        bd2 = d2;
+        best = w;
+      }
+    }
+    if (best) this._relocate(best);
+  }
+
+  // Per-frame motion for one animal. It runs toward a target (a hunter's prey,
+  // or a wolf's bear in a brawl) or away from a threat (a predator, or a bear
+  // an outnumbered wolf fears); with neither it wanders — short random moves
+  // and pauses at the slow gait. A brawling bear holds its ground and shudders.
+  // Only running animals recompute a heading (one sqrt) each frame.
+  _stepAnimal(a, dt) {
     const prof = a.prof;
+
+    if (a.kind === 'bear' && a.fighting) {
+      a.paused = false;
+      a.running = true; // bigger, faster bob reads as a struggle
+      a.bobPhase += dt * 7;
+      return;
+    }
+
+    const react = a.target || a.threat;
     let speed = 0;
     let moving = false;
     a.running = false;
 
-    if (prey) {
-      let vx = prey.x - a.x;
-      let vy = prey.y - a.y;
-      if (prof.flee) {
+    if (react) {
+      let vx = react.x - a.x;
+      let vy = react.y - a.y;
+      if (a.threat) {
         vx = -vx;
         vy = -vy;
       }
       const len = Math.hypot(vx, vy) || 1;
       a.dx = vx / len;
       a.dy = vy / len;
-      speed = prof.runSpeed;
+      speed = prof.run;
       moving = true;
       a.running = true;
       a.paused = false;
@@ -1291,52 +1535,72 @@ export class Engine {
         }
       }
       if (!a.paused) {
-        speed = prof.wanderSpeed;
+        speed = prof.wander;
         moving = true;
       }
     }
 
     if (moving) {
+      // Idle wolves ease toward their pack's travel direction so the group
+      // moves as one; a chasing/fleeing wolf has no packDir and steers freely.
+      if (a.packDir && !react) {
+        a.dx += (a.packDir.x - a.dx) * WOLF_PACK_STEER;
+        a.dy += (a.packDir.y - a.dy) * WOLF_PACK_STEER;
+        const l = Math.hypot(a.dx, a.dy) || 1;
+        a.dx /= l;
+        a.dy /= l;
+      }
       this._moveAnimal(a, speed * dt);
       a.bobPhase += speed * dt * ANIMAL_BOUNCE_RATE;
       if (a.dx < -0.05) a.face = -1;
       else if (a.dx > 0.05) a.face = 1;
+      // A hunter that reaches its prey catches it — the prey respawns elsewhere.
+      const t = a.target;
+      if (t && prof.prey === t.kind) {
+        const dx = t.x - a.x;
+        const dy = t.y - a.y;
+        if (dx * dx + dy * dy <= ANIMAL_CATCH * ANIMAL_CATCH) {
+          this._relocate(t);
+          a.target = null;
+        }
+      }
     }
   }
 
-  // Advances an animal by `step` world px along its heading, but only onto
-  // savannah inside the walkable world. Blocked head-on it slides along
-  // whichever single axis is clear (skimming biome edges instead of sticking);
-  // fully boxed in it turns to a new random heading and waits a frame.
+  // Advances an animal by `step` world px along its heading, but only onto its
+  // home biome inside the walkable world. Blocked head-on it veers by a growing
+  // angle (see ANIMAL_DEFLECT) to slip along the boundary and out of corners
+  // rather than sticking — so a running chase barely wavers before resuming.
   _moveAnimal(a, step) {
     const b = this.worldBounds;
-    const nx = a.x + a.dx * step;
-    const ny = a.y + a.dy * step;
-    if (this._animalCanStand(nx, ny, b)) {
+    const biome = a.prof.biome;
+    const tryDir = (dx, dy) => {
+      const nx = a.x + dx * step;
+      const ny = a.y + dy * step;
+      if (!this._animalCanStand(nx, ny, b, biome)) return false;
       a.x = nx;
       a.y = ny;
-      return;
+      a.dx = dx;
+      a.dy = dy;
+      return true;
+    };
+    if (tryDir(a.dx, a.dy)) return;
+    const base = Math.atan2(a.dy, a.dx);
+    for (const off of ANIMAL_DEFLECT) {
+      const ang = base + off;
+      if (tryDir(Math.cos(ang), Math.sin(ang))) return;
     }
-    if (this._animalCanStand(nx, a.y, b)) {
-      a.x = nx;
-      a.dy = -a.dy;
-      return;
-    }
-    if (this._animalCanStand(a.x, ny, b)) {
-      a.y = ny;
-      a.dx = -a.dx;
-      return;
-    }
+    // Fully boxed in — face a new random way and wait a frame.
     const ang = Math.random() * TAU;
     a.dx = Math.cos(ang);
     a.dy = Math.sin(ang);
   }
 
-  _animalCanStand(x, y, b) {
+  _animalCanStand(x, y, b, biome) {
     if (b && (x < b.minX - WORLD_MARGIN || x > b.maxX + WORLD_MARGIN || y < b.minY - WORLD_MARGIN || y > b.maxY + WORLD_MARGIN)) {
       return false;
     }
-    return this.tileAt(Math.floor(x / TILE), Math.floor(y / TILE)) === TERRAIN.SAVANNAH;
+    return this.tileAt(Math.floor(x / TILE), Math.floor(y / TILE)) === biome;
   }
 
   // Adds on-screen animals to the scene's depth-sorted draw list as
@@ -1348,28 +1612,25 @@ export class Engine {
     const maxX = camX + viewW + ANIMAL_DRAW_PAD;
     const minY = camY - ANIMAL_DRAW_PAD;
     const maxY = camY + viewH + ANIMAL_DRAW_PAD;
-    const add = (arr) => {
-      for (const a of arr) {
-        if (a.x < minX || a.x > maxX || a.y < minY || a.y > maxY) continue;
-        const pool = this.decor[a.prof.pool];
-        if (!pool || !pool.length) continue;
-        const amp = a.running ? ANIMAL_BOUNCE * ANIMAL_RUN_BOUNCE : ANIMAL_BOUNCE;
-        const bob = a.paused ? 0 : Math.abs(Math.sin(a.bobPhase)) * amp;
-        decor.push({
-          x: a.x,
-          y: a.y,
-          w: a.prof.size,
-          h: a.prof.size,
-          img: pool[a.variant % pool.length],
-          bob,
-          flip: a.face < 0,
-          key: null,
-          interact: null
-        });
-      }
-    };
-    add(this.lions);
-    add(this.zebras);
+    for (const a of this.animals) {
+      if (a.dead) continue;
+      if (a.x < minX || a.x > maxX || a.y < minY || a.y > maxY) continue;
+      const pool = this.decor[a.prof.pool];
+      if (!pool || !pool.length) continue;
+      const amp = a.running ? ANIMAL_BOUNCE * ANIMAL_RUN_BOUNCE : ANIMAL_BOUNCE;
+      const bob = a.paused ? 0 : Math.abs(Math.sin(a.bobPhase)) * amp;
+      decor.push({
+        x: a.x,
+        y: a.y,
+        w: a.prof.size,
+        h: a.prof.size,
+        img: pool[a.variant % pool.length],
+        bob,
+        flip: a.face < 0,
+        key: null,
+        interact: null
+      });
+    }
   }
 
   // Maps a coherence value in [0,1) to a variant index using per-variant
@@ -1517,6 +1778,17 @@ export class Engine {
     }
 
     const decor = this.visibleDecor(b.minX - pad, b.minY - pad, fullW, fullH);
+    // Include the wildlife where it currently stands, depth-sorted in with the
+    // decor, so a shared world shows its animals too (drawn flat — no hop).
+    if (this.animalsOn && this.animals.length) {
+      for (const a of this.animals) {
+        if (a.dead) continue;
+        const pool = this.decor[a.prof.pool];
+        if (!pool || !pool.length) continue;
+        decor.push({ x: a.x, y: a.y, w: a.prof.size, h: a.prof.size, img: pool[a.variant % pool.length] });
+      }
+      decor.sort((d1, d2) => d1.y - d2.y);
+    }
     for (const d of decor) {
       const w = Math.max(1, Math.round(d.w * scale));
       const h = Math.max(1, Math.round(d.h * scale * (d.img.height / d.img.width)));
@@ -1624,9 +1896,9 @@ export class Engine {
         decorDirty = true;
       }
     }
-    // Lions and zebras join the scene's single depth sort, so they occlude and
-    // are occluded by trees and the player correctly as they roam.
-    if (this.animalsOn && (this.lions.length || this.zebras.length)) {
+    // Animals join the scene's single depth sort, so they occlude and are
+    // occluded by trees and the player correctly as they roam.
+    if (this.animalsOn && this.animals.length) {
       this._pushAnimals(decor, camX, camY, viewW, viewH);
       decorDirty = true;
     }
