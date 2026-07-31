@@ -1,3 +1,5 @@
+import { encodeRecipe, decodeRecipe, POINT_PLACES, SEED_PLACES, ROUGH_PLACES } from './sharecode';
+
 export const TILE = 3; // fine terrain pixel size on screen
 export const SCALE = 5; // fine tiles per AI grid unit (the AI thinks in ~15px cells)
 
@@ -44,12 +46,56 @@ const WATER = new Set([TERRAIN.RIVER, TERRAIN.OCEAN]);
 
 const CHUNK = 64; // fine tiles per chunk side (192px canvases)
 const CHAR_DRAW = 96; // 16px sprite drawn at 6x
+
+// How the scene adapts to the viewport. The player sprite is drawn at a fixed
+// device-pixel size, so on a phone it would otherwise fill a quarter of the
+// screen while you saw almost no world around it. Below SCENE_REF (the
+// viewport's smaller side, in CSS px) the sprite AND the world scale down
+// together by sceneScale, which keeps their proportions identical and simply
+// fits more world on screen.
+//
+// The steps exist because the sprite is 16px: CHAR_DRAW * step must stay a
+// whole multiple of 16 (96/80/64/48 = 6x/5x/4x/3x). A fractional scale would
+// round some sprite pixels to 3 screen pixels and their neighbours to 4,
+// which reads as a wobble in pixel art.
+const SCENE_STEPS = [0.5, 2 / 3, 5 / 6, 1];
+const SCENE_REF = 720;
 const CHAR_SPEED = 220; // px per second, at zoom 1
 const WORLD_MARGIN = 220; // walkable padding beyond the painted world's bounding box
 const BLOB_FRONT_SPEED = 160; // fine tiles of effective distance revealed per second
 const WALK_FPS = 8;
 const WATER_FPS = 2;
 const IDLE_SPF = 1; // seconds per idle frame, per design
+// Animated decor (flowers) draws from a horizontal strip of equal-width
+// frames — an upright pose and a swaying one. Which frame a given bloom
+// shows comes from a sine wave travelling across the world in +x, so the
+// sway sweeps the meadow left to right and reads as a gust of wind crossing
+// it rather than every flower twitching independently.
+// Gusts are spaced irregularly: a slow noise field stretches and squeezes the
+// phase along the wind's axis, so the gap from one gust to the next wanders
+// instead of repeating on a fixed period.
+//
+// The warp must never out-run the base gradient, or phase stops rising with
+// distance and the front stalls or runs backwards. Worst-case warp slope is
+// VARY * SPACING_SCALE * 1.5 (1.5 being smoothstep's steepest); it has to stay
+// under 1/WAVELENGTH. Because SPACING_SCALE is expressed as a fraction OF the
+// wavelength, that reduces to VARY < GUSTS_PER_PATTERN / 1.5 — independent of
+// WAVELENGTH, so retuning the spacing can't silently break the wave.
+const WIND_WAVELENGTH = 2080; // AVERAGE world px between gusts; the warp varies the actual gap
+const WIND_TRAVEL = 120; // world px per second the gust front sweeps (left → right)
+const WIND_PHASE_RATE = WIND_TRAVEL / WIND_WAVELENGTH; // gusts per second, on average
+const WIND_GUSTS_PER_PATTERN = 4.3; // gusts before the spacing pattern itself has redrawn
+const WIND_SPACING_VARY = 1.1; // how far the warp can shift a gust (wavelengths); < 4.3/1.5 stays safe
+const WIND_SPACING_SCALE = 1 / (WIND_WAVELENGTH * WIND_GUSTS_PER_PATTERN); // per world px
+// Share of each gust a sprite spends in its swayed (last) frame, and the sine
+// value that gates it: sin >= cos(π·share) holds for exactly `share` of every
+// cycle, so the share reads directly as the fraction of time bent over. 0.5
+// would be an even split; 0.25 makes the sway a passing gust rather than the
+// resting state.
+const WIND_SWAY_SHARE = 0.25;
+const WIND_SWAY_GATE = Math.cos(Math.PI * WIND_SWAY_SHARE);
+const WIND_FRONT_TILT = 0.2; // slight diagonal lean of the gust front, so it isn't a ruler-straight line
+const WIND_JITTER = 0.14; // per-flower phase scatter (wavelengths) — softens the boundary
 const RIVER_RADIUS = 2.4; // fine tiles at width 1 — ~14px wide water
 const RIVER_EDGE_WAVE = 0.5; // fixed edge waviness (tiles); NOT scaled by width, so wide rivers stay clean
 const CONNECT_RANGE = 100; // fine tiles — max gap auto-bridged between rivers
@@ -162,7 +208,10 @@ const PROFILES = {
   zebra: { pool: 'zebra', biome: TERRAIN.SAVANNAH, size: 30, wander: 52, run: 170, moveTime: [0.6, 1.3], pauseTime: [0.8, 2.2], role: 'prey', pred: 'lion', sight: 130, safe: 260 },
   wolf: { pool: 'wolf', biome: TERRAIN.FOREST, size: 27, wander: 50, run: 152, moveTime: [0.6, 1.4], pauseTime: [0.25, 0.7], role: 'wolf', prey: 'deer', sight: 250 },
   deer: { pool: 'deer', biome: TERRAIN.FOREST, size: 30, wander: 54, run: 176, moveTime: [0.6, 1.3], pauseTime: [0.7, 2.0], role: 'prey', pred: 'wolf', sight: 125, safe: 250 },
-  bear: { pool: 'bear', biome: TERRAIN.FOREST, size: 37, wander: 38, run: 118, moveTime: [0.8, 1.7], pauseTime: [0.5, 1.1], role: 'bear' }
+  // A bear ambles when idle but CHARGES faster than a wolf can run (152), so
+  // the one or two wolves that flee it can actually be run down and killed —
+  // it stops dead and brawls instead once a pack of three gangs up on it.
+  bear: { pool: 'bear', biome: TERRAIN.FOREST, size: 37, wander: 38, run: 168, moveTime: [0.8, 1.7], pauseTime: [0.5, 1.1], role: 'bear', prey: 'wolf' }
 };
 
 // Per-kind population caps (≥3 wolves so a bear brawl is possible).
@@ -190,32 +239,64 @@ const FOREST_TREE_DENSITY = 0.9;
 //   interact: 'trample'    — walking onto it sinks it into the ground and
 //                            fades it out, then it regrows once the player
 //                            has moved off for a bit (Engine#_updateTrample).
-//   scaleJitter: true      — each instance gets a small random size variance.
 //   regionalVariant: true  — nearby instances lean toward the same pool
 //                            variant (reads like a patch/species) instead
 //                            of a pure per-cell random pick.
+//   animated: true         — pool sprites are horizontal frame strips, of
+//                            however many square-ish frames fit across each
+//                            one, cycled by the wind wave (see WIND_*). A
+//                            single-frame sprite in the pool just sits still.
+//   rare: { img, chance }  — a one-of-a-kind sprite each cell has `chance` of
+//                            being. Only the first cell anywhere to win it
+//                            ever becomes it, so exactly one can exist in the
+//                            world at a time (Engine#_claimRare).
 //
-// Forest stays dense and leafy; the rest are sparser set-dressing. Meadow
-// flowers use `drift`: coverage is a smooth, continuously-varying
-// probability field — never a hard-edged patch — so meadows read as an
-// organic, mostly-covered field rather than scattered blotches.
+// Each biome holds a LIST of layers, each with its own lattice, so a biome can
+// carry more than one kind of decor (savanna scatters acacias over a field of
+// grass). `seed` shifts a layer's lattice off its neighbours' — two layers on
+// one biome would otherwise hash to identical cells and stack perfectly.
+//
+// Forest stays dense and leafy; the rest are sparser set-dressing. Ground
+// cover (meadow flowers, savanna grass) uses `drift`: coverage is a smooth,
+// continuously-varying probability field — never a hard-edged patch — so it
+// reads as an organic, mostly-covered field rather than scattered blotches.
 const DECOR = {
-  [TERRAIN.FOREST]: { img: 'tree', cell: 5, density: FOREST_TREE_DENSITY, w: 30, h: 30, interact: 'trample' },
-  [TERRAIN.SAVANNAH]: { img: 'acacia', cell: 14, density: 0.2, w: 39, h: 36, interact: 'trample' },
-  [TERRAIN.DESERT]: { img: 'cactus', cell: 22, density: 0.06, w: 42, h: 54, interact: 'trample' },
-  [TERRAIN.MOUNTAIN]: { img: 'mountain', cell: 10, density: 0.28, w: 184, h: 176 },
-  [TERRAIN.TUNDRA]: { img: 'snowtree', cell: 12, density: FOREST_TREE_DENSITY * 0.75, w: 27, h: 30, interact: 'trample' },
-  [TERRAIN.GRASS]: {
-    img: 'flower',
-    cell: 8,
-    density: 0.06,
-    w: 18,
-    h: 18,
-    drift: true,
-    interact: 'trample',
-    scaleJitter: true,
-    regionalVariant: true
-  }
+  [TERRAIN.FOREST]: [{ img: 'tree', cell: 5, density: FOREST_TREE_DENSITY, w: 30, h: 30, interact: 'trample' }],
+  [TERRAIN.SAVANNAH]: [
+    {
+      img: 'savannagrass',
+      seed: 3,
+      // Same packing as the meadow's flowers and the forest's trees, so the
+      // savanna floor reads as continuous grass with acacias standing over it.
+      cell: 5,
+      density: FOREST_TREE_DENSITY,
+      w: 30,
+      h: 30,
+      drift: true,
+      interact: 'trample',
+      animated: true
+    },
+    { img: 'acacia', cell: 14, density: 0.2, w: 39, h: 36, interact: 'trample' }
+  ],
+  [TERRAIN.DESERT]: [{ img: 'cactus', cell: 22, density: 0.06, w: 42, h: 54, interact: 'trample' }],
+  [TERRAIN.MOUNTAIN]: [{ img: 'mountain', cell: 10, density: 0.28, w: 156, h: 149 }],
+  [TERRAIN.TUNDRA]: [{ img: 'snowtree', cell: 12, density: FOREST_TREE_DENSITY * 0.75, w: 27, h: 30, interact: 'trample' }],
+  [TERRAIN.GRASS]: [
+    {
+      img: 'flower',
+      // Packed as tightly as the forest's trees — same lattice, same fill
+      // chance — so a meadow reads as solid bloom rather than scattering.
+      cell: 5,
+      density: FOREST_TREE_DENSITY,
+      w: 36,
+      h: 36,
+      drift: true,
+      interact: 'trample',
+      regionalVariant: true,
+      animated: true,
+      rare: { img: 'determination', chance: 0.001 }
+    }
+  ]
 };
 
 // Mountains form clusters instead of scattering uniformly. A coarse
@@ -381,7 +462,23 @@ export class Engine {
     this.charX = 0;
     this.charY = 0;
     this.zoom = ZOOM_DEFAULT;
+    // Set for real by resize() at the end of the constructor; declared here
+    // so nothing reads it as undefined in between.
+    this.sceneScale = 1;
     this.history = [];
+    // Every resolved terrain action ever applied, oldest first — the world's
+    // build recipe, and the whole content of a share code (see shareCode /
+    // loadCode). Kept in lockstep with the world: undo pops the action it
+    // reverts.
+    //
+    // Replaying it from an empty world rebuilds this world, with one known
+    // seam: when a single command produces several features, their growth
+    // animations run CONCURRENTLY and interleave tile by tile, while replay
+    // applies them one after another. Since paint() decides what may cover
+    // what, two features that overlap while both were still growing can
+    // settle their shared border slightly differently on replay. Everything
+    // else — shapes, seeds, placement — is exact.
+    this.recipe = [];
     this.riverEndpoints = [];
     // Growing bounding box of everything painted so far — the walkable
     // world is a simple rectangle around it (see #update), and it's also
@@ -396,12 +493,14 @@ export class Engine {
     this._twSpawnT = 0;
     this.clouds = [];
     this.cloudsOn = false;
-    // Predator–prey wildlife — one flat array of all species, off until
-    // toggled on. _animalsDirty defers the removal filter to frames where
-    // something actually died/left its biome.
+    // Cell key of the world's single rare bloom, once some cell has won it.
+    this.rareCell = null;
+    // Predator–prey wildlife — one flat array of all species, on from the
+    // start (see setAnimals). _animalsDirty defers the removal filter to
+    // frames where something actually died/left its biome.
     this.animals = [];
-    this.animalsOn = false;
-    this._animSpawnT = 0;
+    this.animalsOn = true;
+    this._animSpawnT = ANIMAL_SPAWN_CHECK; // spawn a first batch on the very next frame
     this._animThinkT = 0;
     this._animalsDirty = false;
     this.resize(window.innerWidth, window.innerHeight);
@@ -487,6 +586,27 @@ export class Engine {
     this.canvas.width = w;
     this.canvas.height = h;
     this.ctx.imageSmoothingEnabled = false;
+    this.sceneScale = Engine.sceneScaleFor(w, h);
+  }
+
+  // Viewport size -> scene scale, snapped to the nearest crisp step. Keyed on
+  // the SMALLER side so a short landscape window scales down the same way a
+  // narrow portrait one does — in both cases it's the short axis that decides
+  // how much world actually fits.
+  static sceneScaleFor(w, h) {
+    const raw = Math.min(w, h) / SCENE_REF;
+    return SCENE_STEPS.reduce((best, s) => (Math.abs(s - raw) < Math.abs(best - raw) ? s : best), SCENE_STEPS[0]);
+  }
+
+  // World -> screen scale actually used for drawing: what the player asked
+  // for, times what the viewport can accommodate.
+  get renderZoom() {
+    return this.zoom * this.sceneScale;
+  }
+
+  // The player sprite's on-screen size, in device pixels.
+  get charDraw() {
+    return CHAR_DRAW * this.sceneScale;
   }
 
   setKey(code, down) {
@@ -714,6 +834,9 @@ export class Engine {
     const snap = this.history.pop();
     if (!snap) return false;
     this.jobs = [];
+    // The recipe describes the world, so reverting the world reverts it too
+    // — otherwise a share code would rebuild changes the player took back.
+    this.recipe.pop();
     this.riverEndpoints = snap.riverEndpoints;
     this.worldBounds = snap.bounds;
     this.chunks = new Map();
@@ -739,16 +862,86 @@ export class Engine {
     return this.jobs.length > 0;
   }
 
-  applyEngineData(data) {
-    if (!data || !data.terrain || !(data.terrain in TERRAIN_CODES)) return false;
-    const code = TERRAIN_CODES[data.terrain];
+  // A code that rebuilds this exact world, or null if nothing's been built.
+  shareCode() {
+    return encodeRecipe(this.recipe);
+  }
+
+  // Rebuilds the world from a share code, replacing whatever is here now.
+  // Resolves to the number of actions replayed, or null if the code is
+  // unreadable — in which case the current world is left untouched, since
+  // decoding fully succeeds or fails before anything is torn down.
+  async loadCode(code) {
+    const recipe = await decodeRecipe(code);
+    if (!recipe) return null;
+    this._clearWorld();
+    // Instant, and with no undo history: a shared world should simply be
+    // there when you arrive, as a starting point rather than something you
+    // can rewind past its own beginning. Each replayed action re-enters the
+    // recipe, so a loaded world can be built on and re-shared like any other.
+    for (const a of recipe) this._runAction(a, { instant: true, snapshot: false });
+    this._placeCharacterOnLand();
+    return recipe.length;
+  }
+
+  // Wipes all terrain and everything derived from it. Zoom, clouds/animals
+  // toggles and other player settings are deliberately left alone — loading
+  // a code replaces the land, not your preferences.
+  _clearWorld() {
+    this.jobs = [];
+    this.chunks = new Map();
+    this.history = [];
+    this.recipe = [];
+    this.riverEndpoints = [];
+    this.worldBounds = null;
+    this.animals = [];
+    this.trample = new Map();
+    this.ripples = [];
+    this.tumbleweeds = [];
+    this._lastRipplePos = null;
+    this._rippleDist = 0;
+    this._animalsDirty = false;
+    // Repopulate the herds for the new land on the next frame.
+    this._animSpawnT = ANIMAL_SPAWN_CHECK;
+  }
+
+  // Drops the player somewhere sensible in a freshly loaded world: the
+  // origin if it's on solid ground (worlds are built around where their
+  // maker stood, so it usually is), otherwise the middle of the land.
+  _placeCharacterOnLand() {
+    const onGround = (x, y) => this.tileAt(Math.floor(x / TILE), Math.floor(y / TILE)) !== TERRAIN.VOID;
+    if (onGround(0, 0)) {
+      this.charX = 0;
+      this.charY = 0;
+      return;
+    }
+    const b = this.worldBounds;
+    if (!b) return;
+    this.charX = (b.minX + b.maxX) / 2;
+    this.charY = (b.minY + b.maxY) / 2;
+  }
+
+  // Turns one AI action into a RESOLVED action: every "it depends" — the
+  // default center, the random seed, a river's auto-connect, a lake snapping
+  // to a river mouth — is decided here and baked into plain numbers. What
+  // comes out depends only on the world as it stands right now, so replaying
+  // resolved actions in order rebuilds the world without re-deciding
+  // anything. This is what share codes carry (see sharecode.js); the
+  // rounding matches the codec's precision so a shared world is identical to
+  // the one that was shared, not merely similar.
+  //
+  //   blob   { k, x, y, r, s, g, o }  center/radius in fine tiles
+  //   river  { k: 'river', p: [{x, y}], w, o }
+  _resolveAction(data) {
+    if (!data || !data.terrain || !(data.terrain in TERRAIN_CODES)) return null;
     const overwrite = !!data.overwrite;
+    const r2 = (n, places) => Math.round(n * 10 ** places) / 10 ** places;
 
     if (data.terrain === 'river') {
       const pts = (data.points || [])
         .map((p) => ({ x: Number(p.x) * SCALE + SCALE / 2, y: Number(p.y) * SCALE + SCALE / 2 }))
         .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
-      if (pts.length < 2) return false;
+      if (pts.length < 2) return null;
 
       // Join to the closest existing river unless the AI says not to.
       if (data.connect !== false) {
@@ -761,51 +954,98 @@ export class Engine {
         }
       }
 
-      const width = Math.min(5, Math.max(0.4, Number(data.width) || 1));
-      const tiles = riverTiles(pts, RIVER_RADIUS * width);
-      if (!tiles.length) return false;
-      this.snapshot();
-      this.riverEndpoints.push({ x: pts[0].x, y: pts[0].y }, { x: pts[pts.length - 1].x, y: pts[pts.length - 1].y });
-      const total = tiles[tiles.length - 1].d;
-      this.jobs.push({ tiles, idx: 0, front: 0, speed: Math.max(70, total / 1.4), code, overwrite });
-    } else {
-      const here = this.charTile();
-      const isLake = data.terrain === 'lake';
-      const isOcean = data.terrain === 'ocean';
-      const coarseX = Number.isFinite(Number(data.centerX)) ? Number(data.centerX) : here.x;
-      const coarseY = Number.isFinite(Number(data.centerY)) ? Number(data.centerY) : here.y;
-      const coarseR = Math.min(160, Math.max(3, Number(data.maxRadius) || (isLake ? 12 : isOcean ? 38 : 40)));
-      const seed = Number.isFinite(Number(data.seed)) ? Number(data.seed) : Math.random() * 1000;
-      const roughness = Math.min(0.8, Math.max(0.3, Number(data.roughness) || 0.55));
-      let cx = coarseX * SCALE + SCALE / 2;
-      let cy = coarseY * SCALE + SCALE / 2;
+      return {
+        k: 'river',
+        p: pts.map((p) => ({ x: r2(p.x, POINT_PLACES), y: r2(p.y, POINT_PLACES) })),
+        w: r2(Math.min(5, Math.max(0.4, Number(data.width) || 1)), 2),
+        o: overwrite
+      };
+    }
 
-      // Lakes can snap onto the mouth of an existing river.
-      if (isLake && data.atRiverEnd) {
-        let target = null;
-        let bestD = Infinity;
-        for (const e of this.riverEndpoints) {
-          const d = Math.hypot(e.x - cx, e.y - cy);
-          if (d < bestD) {
-            bestD = d;
-            target = e;
-          }
-        }
-        if (!target) target = this.nearestRiverTile(cx, cy);
-        if (target) {
-          cx = target.x;
-          cy = target.y;
+    const here = this.charTile();
+    const isLake = data.terrain === 'lake';
+    const isOcean = data.terrain === 'ocean';
+    const coarseX = Number.isFinite(Number(data.centerX)) ? Number(data.centerX) : here.x;
+    const coarseY = Number.isFinite(Number(data.centerY)) ? Number(data.centerY) : here.y;
+    const coarseR = Math.min(160, Math.max(3, Number(data.maxRadius) || (isLake ? 12 : isOcean ? 38 : 40)));
+    const seed = Number.isFinite(Number(data.seed)) ? Number(data.seed) : Math.random() * 1000;
+    const roughness = Math.min(0.8, Math.max(0.3, Number(data.roughness) || 0.55));
+    let cx = coarseX * SCALE + SCALE / 2;
+    let cy = coarseY * SCALE + SCALE / 2;
+
+    // Lakes can snap onto the mouth of an existing river.
+    if (isLake && data.atRiverEnd) {
+      let target = null;
+      let bestD = Infinity;
+      for (const e of this.riverEndpoints) {
+        const d = Math.hypot(e.x - cx, e.y - cy);
+        if (d < bestD) {
+          bestD = d;
+          target = e;
         }
       }
+      if (!target) target = this.nearestRiverTile(cx, cy);
+      if (target) {
+        cx = target.x;
+        cy = target.y;
+      }
+    }
 
+    return {
+      k: data.terrain,
+      x: r2(cx, 1),
+      y: r2(cy, 1),
+      r: r2(coarseR * SCALE, 1),
+      s: r2(seed, SEED_PLACES),
+      g: r2(roughness, ROUGH_PLACES),
+      o: overwrite
+    };
+  }
+
+  // Runs a resolved action: rasterizes its tiles, banks an undo snapshot and
+  // appends to the recipe.
+  //   instant   paint every tile now instead of growing it over time — for
+  //             share-code replay, where a 40-action world would otherwise
+  //             take a minute to appear.
+  //   snapshot  bank an undo step. Off during replay: each snapshot deep-
+  //             copies every chunk, so a 50-action world would copy the
+  //             whole map 50 times over to build history nobody can use.
+  _runAction(a, { instant = false, snapshot = true } = {}) {
+    const code = TERRAIN_CODES[a.k];
+    if (code === undefined) return false;
+
+    let tiles;
+    let speed;
+    if (a.k === 'river') {
+      tiles = riverTiles(a.p, RIVER_RADIUS * a.w);
+      if (!tiles.length) return false;
+      speed = Math.max(70, tiles[tiles.length - 1].d / 1.4);
+    } else {
       // Water bodies skip the per-pixel jag noise (smooth=true) so lakes
       // and oceans rasterize as one clean, contiguous body with no stray
       // isolated pixels fraying off the edge.
-      const tiles = blobTiles(cx, cy, coarseR * SCALE, seed, roughness, WATER.has(code));
-      this.snapshot();
-      this.jobs.push({ tiles, idx: 0, front: 0, speed: BLOB_FRONT_SPEED, code, overwrite });
+      tiles = blobTiles(a.x, a.y, a.r, a.s, a.g, WATER.has(code));
+      speed = BLOB_FRONT_SPEED;
+    }
+
+    if (snapshot) this.snapshot();
+    if (a.k === 'river') {
+      this.riverEndpoints.push({ x: a.p[0].x, y: a.p[0].y }, { x: a.p[a.p.length - 1].x, y: a.p[a.p.length - 1].y });
+    }
+    this.recipe.push(a);
+
+    if (instant) {
+      for (const t of tiles) this.paint(t.x, t.y, code, a.o);
+    } else {
+      this.jobs.push({ tiles, idx: 0, front: 0, speed, code, overwrite: a.o });
     }
     return true;
+  }
+
+  applyEngineData(data, instant = false) {
+    const action = this._resolveAction(data);
+    if (!action) return false;
+    return this._runAction(action, { instant });
   }
 
   // Feet position in world px — used for ground checks (water/collision),
@@ -816,6 +1056,12 @@ export class Engine {
   }
 
   // Where the sprite's feet VISUALLY land in world px at the current zoom.
+  //
+  // sceneScale deliberately does NOT appear in this (or _trampleRadius, or
+  // the depth-sort's playerBase): the sprite's pixel size and the world's
+  // render scale both carry it, so it cancels out of every screen-box →
+  // world conversion. Shrinking the scene changes how much world you SEE,
+  // never how much world the character occupies.
   // The player is drawn at a fixed on-screen size, so its feet correspond
   // to a world offset that shrinks as you zoom in and grows as you zoom
   // out (÷zoom). Ripples and the trample check both anchor here so they
@@ -857,7 +1103,7 @@ export class Engine {
       // Screen-space speed stays constant across zoom levels: zoomed out,
       // more world is visible, so moving faster underfoot keeps the same
       // pace on screen instead of feeling like a crawl.
-      const speed = CHAR_SPEED / this.zoom;
+      const speed = CHAR_SPEED / this.renderZoom;
       const dx = (vx / len) * speed * dt;
       const dy = (vy / len) * speed * dt;
       const b = this.worldBounds;
@@ -912,6 +1158,12 @@ export class Engine {
   // ground and fades it out; once the player has moved off it for a bit,
   // it grows back. New decor types opt into this for free just by adding
   // `interact: 'trample'` to their DECOR entry.
+  //
+  // The sweep runs on the SAME LOD lattice the renderer is currently drawing
+  // (see visibleDecor), so whatever sprite is on screen is the sprite that
+  // gets trampled — zoomed right out, that's the big merged stand-in. Any
+  // other choice would key trample entries to a lattice nothing is drawing
+  // from, and walking would appear to do nothing.
   _updateTrample(dt) {
     const pt = this._interactionPoint();
     const now = this.time;
@@ -922,29 +1174,35 @@ export class Engine {
     // width). Standing on one starts it sinking, or (if already
     // mid-animation) just refreshes when it was last stood on.
     const trampleR = this._trampleRadius();
+    const lod = Math.max(1, 1 / this.renderZoom);
     const nearNow = new Set();
     for (const codeKey of Object.keys(DECOR)) {
-      const cfg = DECOR[codeKey];
-      if (!cfg.interact) continue;
       const codeNum = Number(codeKey);
-      const pitch = cfg.cell * TILE;
-      const gx0 = Math.floor(pt.x / pitch);
-      const gy0 = Math.floor(pt.y / pitch);
-      const reach = Math.max(1, Math.ceil((trampleR + cfg.w * 0.5) / pitch));
-      for (let oy = -reach; oy <= reach; oy++) {
-        for (let ox = -reach; ox <= reach; ox++) {
-          const item = this.decorAt(codeNum, cfg, gx0 + ox, gy0 + oy);
-          if (!item) continue;
-          if (Math.hypot(item.x - pt.x, item.y - pt.y) > trampleR + item.w * 0.15) continue;
-          nearNow.add(item.key);
-          const st = this.trample.get(item.key);
-          if (!st || st.state === 'up') {
-            this.trample.set(item.key, { state: 'sinking', since: now, lastNear: now });
-          } else {
-            st.lastNear = now;
-            if (st.state === 'growing') {
-              st.state = 'sinking';
-              st.since = now;
+      for (const cfg of DECOR[codeKey]) {
+        if (!cfg.interact) continue;
+        const cell = Engine.lodCell(cfg, lod);
+        const pitch = cell * TILE;
+        const gx0 = Math.floor(pt.x / pitch);
+        const gy0 = Math.floor(pt.y / pitch);
+        // Stand-ins are scaled up by however much the lattice coarsened, so the
+        // neighbourhood to check has to grow with them.
+        const wLod = (cfg.w * cell) / cfg.cell;
+        const reach = Math.max(1, Math.ceil((trampleR + wLod * 0.5) / pitch));
+        for (let oy = -reach; oy <= reach; oy++) {
+          for (let ox = -reach; ox <= reach; ox++) {
+            const item = this.decorAt(codeNum, cfg, gx0 + ox, gy0 + oy, lod);
+            if (!item) continue;
+            if (Math.hypot(item.x - pt.x, item.y - pt.y) > trampleR + item.w * 0.15) continue;
+            nearNow.add(item.key);
+            const st = this.trample.get(item.key);
+            if (!st || st.state === 'up') {
+              this.trample.set(item.key, { state: 'sinking', since: now, lastNear: now });
+            } else {
+              st.lastNear = now;
+              if (st.state === 'growing') {
+                st.state = 'sinking';
+                st.since = now;
+              }
             }
           }
         }
@@ -1105,8 +1363,8 @@ export class Engine {
 
   // Toggles all wildlife. On starts the spawn/think loop (animals fade in on
   // nearby savanna and forest); off clears every herd at once. Mirrors
-  // setClouds — the create bar (AI `animals` flag / the /animal function) and
-  // the wildlife sidebar both route through here.
+  // setClouds — the create bar (AI `animals` flag / the /animal function)
+  // routes through here.
   setAnimals(on) {
     this.animalsOn = !!on;
     if (this.animalsOn) {
@@ -1135,8 +1393,8 @@ export class Engine {
   // (on-screen, not just near the player) and are culled once well outside it,
   // so the visible population scales naturally with zoom.
   _viewRect() {
-    const viewW = this.canvas.width / this.zoom;
-    const viewH = this.canvas.height / this.zoom;
+    const viewW = this.canvas.width / this.renderZoom;
+    const viewH = this.canvas.height / this.renderZoom;
     return { camX: this.charX - viewW / 2, camY: this.charY - viewH / 2, viewW, viewH };
   }
 
@@ -1376,10 +1634,13 @@ export class Engine {
   }
 
   // Wolf⇢bear relationship, applied AFTER wolves have picked a deer to hunt so
-  // it can override that: one or two wolves near a bear flee it; three or more
-  // form a pack and brawl it. A brawl runs on a short timer — partway one wolf
-  // falls, at the end a second wolf and the bear fall, and all three respawn
-  // elsewhere in the forest ("die" = relocate). Bears ignore deer entirely.
+  // it can override that: one or two wolves near a bear flee it — and, since a
+  // charging bear is faster than they are, get run down and killed if they
+  // don't break away (the catch itself is the shared hunter⇢prey one in
+  // _stepAnimal, via the bear's `prey: 'wolf'`). Three or more instead form a
+  // pack and brawl it: on a short timer one wolf falls partway, then a second
+  // wolf and the bear at the end, all respawning elsewhere in the forest
+  // ("die" = relocate). Bears ignore deer entirely.
   _bearThink(wolves, bears) {
     if (!bears.length) {
       for (const w of wolves) {
@@ -1633,6 +1894,25 @@ export class Engine {
     }
   }
 
+  // Lattice pitch, in fine tiles, for a decor type at a given LOD factor.
+  // Rounded to a whole number of tiles because decorAt derives tile
+  // coordinates from it, and a fractional cell puts them between tiles —
+  // where the biome lookup matches nothing and the lattice comes back empty.
+  // Shared with visibleDecor so its sweep and decorAt agree on the pitch.
+  static lodCell(cfg, lod) {
+    return lod > 1 ? Math.max(1, Math.round(cfg.cell * lod)) : cfg.cell;
+  }
+
+  // The position-dependent half of a sprite's wind phase: how far along the
+  // gust axis it sits, plus the slow warp that makes gust spacing irregular.
+  // Resolved once per sprite (in decorAt) so the draw loop only adds the time
+  // term. The warp's slope stays below the 1/WIND_WAVELENGTH base gradient, so
+  // phase always rises with distance and the front never reverses.
+  static windPhaseAt(x, y) {
+    const along = x + y * WIND_FRONT_TILT;
+    return along / WIND_WAVELENGTH + WIND_SPACING_VARY * smoothNoise(along * WIND_SPACING_SCALE, 0, 4.2);
+  }
+
   // Maps a coherence value in [0,1) to a variant index using per-variant
   // weights (a CDF walk), so heavily-weighted variants occupy more of the
   // range. Used to make certain flower colors rarer — see variantWeights.
@@ -1648,16 +1928,30 @@ export class Engine {
 
   // Core per-lattice-cell decor logic, shared by the viewport sweep
   // (visibleDecor) and the interaction sweep (_updateTrample) so they can
-  // never disagree about what exists where. Everything renders at the decor
-  // type's single base cell/size (no LOD). Returns null when this cell has
+  // never disagree about what exists where. Returns null when this cell has
   // nothing, or an item descriptor otherwise.
-  decorAt(codeNum, cfg, gx, gy) {
-    const cell = cfg.cell;
+  //
+  // lod > 1 is the zoomed-out LOD path (see visibleDecor): gx/gy then index a
+  // coarser lattice — roughly lod base cells per side merged into one — so
+  // this samples and returns a single stand-in sprite, scaled up to match,
+  // for the whole merged block instead of each cell in it. Everything below
+  // keys off the resulting (still absolute) tx/ty, so biome/formation/noise
+  // checks need no separate LOD-aware logic.
+  decorAt(codeNum, cfg, gx, gy, lod = 1) {
+    const cell = Engine.lodCell(cfg, lod);
+    // The achieved scale, not `lod` itself — lodCell rounds, and the sprite
+    // must grow by exactly what the lattice actually coarsened by or the
+    // stand-in stops covering the block it replaced.
+    const cellMult = cell / cfg.cell;
+    // Every hash below is seeded from this rather than the bare terrain code,
+    // so two layers sharing a biome scatter independently instead of landing
+    // on exactly the same cells. The biome test still uses the real code.
+    const s = codeNum + (cfg.seed || 0);
     const poolNames = Array.isArray(cfg.img) ? cfg.img : [cfg.img];
     const pools = poolNames.map((n) => this.decor[n]).filter((p) => p && p.length);
     if (!pools.length) return null;
-    const tx = gx * cell + Math.floor(hash(gx, gy, 5.1 + codeNum) * cell);
-    const ty = gy * cell + Math.floor(hash(gx, gy, 9.7 + codeNum) * cell);
+    const tx = gx * cell + Math.floor(hash(gx, gy, 5.1 + s) * cell);
+    const ty = gy * cell + Math.floor(hash(gx, gy, 9.7 + s) * cell);
     // Cheapest rejection first: if this spot isn't the decor's own biome,
     // bail before the (much costlier) formation / drift-noise / density
     // gates below. Zoomed out, most lattice cells fall outside their biome,
@@ -1674,15 +1968,15 @@ export class Engine {
           if (f && inMountainFormation(tx, ty, f)) inside = true;
         }
       }
-      if (!inside || hash(gx, gy, 12.9 + codeNum) > MOUNTAIN_FILL_CHANCE) return null;
+      if (!inside || hash(gx, gy, 12.9 + s) > MOUNTAIN_FILL_CHANCE) return null;
     } else if (cfg.drift) {
       // Continuous coverage: a smooth noise field modulates local density
       // up/down, but there is no hard on/off threshold — so the meadow
       // never shows a sharp patch edge, just organic denser/sparser drifts
       // averaging to "covers most of the ground".
       const localDensity = cfg.density * (0.55 + 0.45 * smoothNoise(tx * 0.02, ty * 0.02, 77.7));
-      if (hash(gx, gy, 12.9 + codeNum) > localDensity) return null;
-    } else if (hash(gx, gy, 12.9 + codeNum) > cfg.density) {
+      if (hash(gx, gy, 12.9 + s) > localDensity) return null;
+    } else if (hash(gx, gy, 12.9 + s) > cfg.density) {
       return null;
     }
 
@@ -1690,53 +1984,100 @@ export class Engine {
     if (pools.length > 1) {
       const region = smoothNoise(tx * 0.011 + 313.7, ty * 0.011, 88.8);
       let si = Math.floor(region * pools.length * 1.999) % pools.length;
-      if (hash(gx, gy, 55.5 + codeNum) < 0.12) si = Math.floor(hash(gx, gy, 56.6 + codeNum) * pools.length) % pools.length;
+      if (hash(gx, gy, 55.5 + s) < 0.12) si = Math.floor(hash(gx, gy, 56.6 + s) * pools.length) % pools.length;
       pool = pools[si];
     }
     // Per-variant weighting (e.g. bluish flowers thinned out) is keyed by
     // the pool name; only applies to single-pool decor like flowers.
     const wspec = poolNames.length === 1 ? this.variantWeights[poolNames[0]] : null;
-    let vi = Math.floor(hash(gx, gy, 41.3 + codeNum) * pool.length) % pool.length;
+    let vi = Math.floor(hash(gx, gy, 41.3 + s) * pool.length) % pool.length;
     if (cfg.regionalVariant && pool.length > 1) {
       // Nearby cells lean toward the same variant (reads like a patch of
       // one species) with occasional strays, instead of a pure per-cell
       // random pick.
-      const region = smoothNoise(tx * 0.02 + 91.1, ty * 0.02, 141.4 + codeNum);
-      const stray = hash(gx, gy, 61.2 + codeNum) < 0.18;
-      const t = stray ? hash(gx, gy, 62.4 + codeNum) : region;
+      const region = smoothNoise(tx * 0.02 + 91.1, ty * 0.02, 141.4 + s);
+      const stray = hash(gx, gy, 61.2 + s) < 0.18;
+      const t = stray ? hash(gx, gy, 62.4 + s) : region;
       vi = wspec ? Engine.weightedVariant(t, wspec) : Math.floor(t * pool.length * 1.999) % pool.length;
     }
-    const scaleJ = cfg.scaleJitter ? 0.8 + hash(gx, gy, 201.3 + codeNum) * 0.42 : 1;
+    // `s` separates the biome's layers and `cell` separates the LOD levels, so
+    // no two lattices can share a trample entry — _updateTrample sweeps at
+    // whatever LOD is on screen, so the key it writes always matches the key
+    // the renderer looks up.
+    const key = s + ':' + cell + ':' + gx + ':' + gy;
+    // The rare one-of-a-kind sprite is only ever placeable at true (1:1)
+    // resolution — a merged LOD block has no single real position for it to
+    // claim, and claiming one per lattice would put a different one on screen
+    // at every zoom level.
+    const img = (cellMult === 1 && this._claimRare(cfg, key, gx, gy, codeNum)) || pool[vi];
+    const x = tx * TILE + TILE / 2;
+    const y = ty * TILE + TILE / 2;
     return {
-      key: codeNum + ':' + gx + ':' + gy,
-      x: tx * TILE + TILE / 2,
-      y: ty * TILE + TILE / 2,
-      w: cfg.w * scaleJ,
-      h: cfg.h * scaleJ,
-      img: pool[vi],
-      interact: cfg.interact || null
+      key,
+      x,
+      y,
+      w: cfg.w * cellMult,
+      h: cfg.h * cellMult,
+      img,
+      interact: cfg.interact || null,
+      // Frames are square-ish, so their count is just how many fit across the
+      // strip — a pool can mix animated and still sprites without extra config.
+      frames: cfg.animated ? Math.max(1, Math.round(img.width / img.height)) : 1,
+      // Everything in the wind phase that depends on where this sprite stands,
+      // resolved once so the draw loop only adds the time term. The jitter
+      // nudges it slightly ahead of or behind the front, so the gust's edge is
+      // ragged rather than a clean sweeping line.
+      windPhase: cfg.animated
+        ? Engine.windPhaseAt(x, y) + (hash(gx, gy, 303.1 + s) - 0.5) * WIND_JITTER
+        : 0
     };
+  }
+
+  // The rare sprite for this cell, or null. Every eligible cell rolls `chance`
+  // for it, but the first one anywhere to win claims it for the rest of the
+  // session — so however far the player roams, only ever one of it exists.
+  _claimRare(cfg, key, gx, gy, codeNum) {
+    if (!cfg.rare) return null;
+    if (this.rareCell && this.rareCell !== key) return null;
+    const pool = this.decor[cfg.rare.img];
+    if (!pool || !pool.length) return null;
+    if (!this.rareCell) {
+      if (hash(gx, gy, 707.3 + codeNum) >= cfg.rare.chance) return null;
+      this.rareCell = key;
+    }
+    return pool[0];
   }
 
   // Deterministic decoration sprites (trees, cacti, peaks, ...) over their
   // biomes inside the viewport, collected across every DECOR lattice and
-  // depth-sorted together. Every type renders at its single base cell/size
-  // regardless of zoom.
-  visibleDecor(camX, camY, viewW, viewH) {
+  // depth-sorted together.
+  //
+  // zoom < 1 (zoomed out) scales the lattice pitch up by the same 1/zoom the
+  // viewport just grew by, so the number of cells swept — and sprites drawn
+  // — stays about what it is at zoom 1, instead of ballooning with the
+  // larger world area now on screen (the original perf problem this LOD
+  // exists to fix). decorAt scales each stand-in sprite to match, so on
+  // screen it still covers roughly one normal sprite's footprint — a single
+  // bigger flower/tree/etc standing in for the cluster of smaller ones it
+  // replaced, at any zoom level, for every biome alike.
+  visibleDecor(camX, camY, viewW, viewH, zoom = 1) {
     const decor = [];
+    const lod = Math.max(1, 1 / zoom);
     for (const codeKey of Object.keys(DECOR)) {
       const codeNum = Number(codeKey);
-      const cfg = DECOR[codeKey];
-      const pitch = cfg.cell * TILE;
-      const pad = Math.max(cfg.h, cfg.w) + 8;
-      const g0x = Math.floor((camX - pad) / pitch);
-      const g1x = Math.floor((camX + viewW + pad) / pitch);
-      const g0y = Math.floor((camY - pad) / pitch);
-      const g1y = Math.floor((camY + viewH + pad) / pitch);
-      for (let gy = g0y; gy <= g1y; gy++) {
-        for (let gx = g0x; gx <= g1x; gx++) {
-          const item = this.decorAt(codeNum, cfg, gx, gy);
-          if (item) decor.push(item);
+      for (const cfg of DECOR[codeKey]) {
+        const cell = Engine.lodCell(cfg, lod);
+        const pitch = cell * TILE;
+        const pad = (Math.max(cfg.h, cfg.w) * cell) / cfg.cell + 8;
+        const g0x = Math.floor((camX - pad) / pitch);
+        const g1x = Math.floor((camX + viewW + pad) / pitch);
+        const g0y = Math.floor((camY - pad) / pitch);
+        const g1y = Math.floor((camY + viewH + pad) / pitch);
+        for (let gy = g0y; gy <= g1y; gy++) {
+          for (let gx = g0x; gx <= g1x; gx++) {
+            const item = this.decorAt(codeNum, cfg, gx, gy, lod);
+            if (item) decor.push(item);
+          }
         }
       }
     }
@@ -1790,9 +2131,11 @@ export class Engine {
       decor.sort((d1, d2) => d1.y - d2.y);
     }
     for (const d of decor) {
+      // A still image, so animated decor is caught mid-gust on its first frame.
+      const frameW = d.img.width / (d.frames || 1);
       const w = Math.max(1, Math.round(d.w * scale));
-      const h = Math.max(1, Math.round(d.h * scale * (d.img.height / d.img.width)));
-      ctx.drawImage(d.img, 0, 0, d.img.width, d.img.height, Math.round((d.x + ox) * scale) - (w >> 1), Math.round((d.y + oy) * scale) - h, w, h);
+      const h = Math.max(1, Math.round(d.h * scale * (d.img.height / frameW)));
+      ctx.drawImage(d.img, 0, 0, frameW, d.img.height, Math.round((d.x + ox) * scale) - (w >> 1), Math.round((d.y + oy) * scale) - h, w, h);
     }
 
     // Mark the player's own position so the shared picture shows where
@@ -1812,7 +2155,7 @@ export class Engine {
 
   draw() {
     const { ctx, canvas } = this;
-    const zoom = this.zoom;
+    const zoom = this.renderZoom;
     // The visible window in world pixels grows as you zoom out; the camera
     // keeps the player centered within it.
     const viewW = canvas.width / zoom;
@@ -1881,7 +2224,7 @@ export class Engine {
     // mountain range reads correctly. Decor is pre-sorted top-to-bottom so
     // sprites stack cleanly.
     const { idle, walk, water } = this.images;
-    const decor = this.visibleDecor(camX, camY, viewW, viewH);
+    const decor = this.visibleDecor(camX, camY, viewW, viewH, zoom);
     let decorDirty = false;
     if (this.tumbleweeds.length) {
       const twPool = this.decor.tumbleweed;
@@ -1907,7 +2250,7 @@ export class Engine {
     // always keeps them dead-center), but the world-space "feet" line decor
     // depth-sorts against must scale with 1/zoom to match that fixed box,
     // or the split point drifts away from the true sprite as you zoom.
-    const playerBase = this.charY + (CHAR_DRAW / 2) / zoom;
+    const playerBase = this.charY + (this.charDraw / 2) / zoom;
     const swimming = this.inWater();
 
     const drawDecor = (t) => {
@@ -1926,8 +2269,28 @@ export class Engine {
           shiftY = k * t.h * 0.5;
         }
       }
+      // Animated decor picks its frame out of the strip from a sine wave
+      // rolling across the world in +x, so the sway visibly crosses the
+      // meadow left to right like a gust rather than flickering in place.
+      const frames = t.frames || 1;
+      const frameW = t.img.width / frames;
+      let srcX = 0;
+      if (frames > 1) {
+        // Every animated sprite — meadow blooms, savanna grass, the rare one —
+        // comes through here, so they all share one wind clock and hold each
+        // frame for exactly as long as each other. The last frame (full sway)
+        // is gated to WIND_SWAY_SHARE of the gust; any in-between poses split
+        // the rest of the cycle evenly below that gate.
+        const phase = t.windPhase - this.time * WIND_PHASE_RATE;
+        const wave = Math.sin(phase * Math.PI * 2);
+        const step =
+          wave >= WIND_SWAY_GATE
+            ? frames - 1
+            : Math.floor(((wave + 1) / (WIND_SWAY_GATE + 1)) * (frames - 1));
+        srcX = Math.min(frames - 1, step) * frameW;
+      }
       const w = Math.max(1, Math.round(t.w * zoom));
-      const h = Math.max(1, Math.round(t.h * zoom * (t.img.height / t.img.width) * scaleY));
+      const h = Math.max(1, Math.round(t.h * zoom * (t.img.height / frameW) * scaleY));
       if (alpha < 1) ctx.globalAlpha = Math.max(0, alpha);
       if (t.rot) {
         // Rolling entities (tumbleweed) pivot around their own center,
@@ -1936,7 +2299,7 @@ export class Engine {
         ctx.save();
         ctx.translate(Math.round(sx(t.x)), Math.round(sy(t.y) - (t.bob || 0) * zoom));
         ctx.rotate(t.rot);
-        ctx.drawImage(t.img, 0, 0, t.img.width, t.img.height, -(w >> 1), -(h >> 1), w, h);
+        ctx.drawImage(t.img, srcX, 0, frameW, t.img.height, -(w >> 1), -(h >> 1), w, h);
         ctx.restore();
       } else {
         // bob lifts the sprite straight up (animals hop as they move); flip
@@ -1948,10 +2311,10 @@ export class Engine {
           ctx.save();
           ctx.translate(dxp + w, dyp);
           ctx.scale(-1, 1);
-          ctx.drawImage(t.img, 0, 0, t.img.width, t.img.height, 0, 0, w, h);
+          ctx.drawImage(t.img, srcX, 0, frameW, t.img.height, 0, 0, w, h);
           ctx.restore();
         } else {
-          ctx.drawImage(t.img, 0, 0, t.img.width, t.img.height, dxp, dyp, w, h);
+          ctx.drawImage(t.img, srcX, 0, frameW, t.img.height, dxp, dyp, w, h);
         }
       }
       if (alpha < 1) ctx.globalAlpha = 1;
@@ -1961,7 +2324,7 @@ export class Engine {
       // the player exactly at canvas center (sx(charX)/sy(charY) reduce to
       // that by construction), so we can draw straight in device pixels
       // without going through the world scale at all.
-      const size = CHAR_DRAW;
+      const size = this.charDraw;
       const dx = Math.round(canvas.width / 2 - size / 2);
       let dy = Math.round(canvas.height / 2 - size / 2);
       if (swimming && water) {

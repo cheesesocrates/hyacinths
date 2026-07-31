@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { gsap } from 'gsap';
 import { animate, scrambleText } from 'animejs';
 import GameCanvas from './game/GameCanvas';
+import { looksLikeCode } from './game/sharecode';
 
 // Rotating splash-screen placeholder: "create" stays fixed and never
 // scrambles — only this suffix (one per supported terrain) animates.
@@ -17,15 +18,34 @@ const PLACEHOLDER_SUFFIXES = [
   'tundra'
 ];
 
-// Numeric (unitless = px) target styles the bar/input/button settle into
-// once the splash screen hands off to normal play — also what the
-// first-submit GSAP transition animates toward.
-const NORMAL_STYLE = {
-  bar: { top: 40, padding: 6, borderRadius: 18 },
-  wrap: { width: 440 },
-  input: { paddingTop: 10, paddingBottom: 10, paddingLeft: 14, paddingRight: 14, fontSize: 15, borderRadius: 12 },
-  button: { paddingTop: 8, paddingBottom: 8, paddingLeft: 14, paddingRight: 14, fontSize: 14, borderRadius: 12 }
-};
+// The bar/input/button geometry the splash transition animates between,
+// read straight off the live elements. Both ends are MEASURED rather than
+// hardcoded so the stylesheet stays the single source of truth — the bar is
+// sized fluidly and its padding, font sizes and position all change across
+// breakpoints, and a table of pixel targets here would land on desktop
+// values mid-animation on a phone before snapping to the real ones.
+function measureBarGeometry(bar, wrap, input, btn) {
+  const num = (v) => parseFloat(v) || 0;
+  const box = (el, keys) => {
+    const cs = getComputedStyle(el);
+    return Object.fromEntries(keys.map((k) => [k, num(cs[k])]));
+  };
+  const padFont = ['paddingTop', 'paddingBottom', 'paddingLeft', 'paddingRight', 'fontSize', 'borderRadius'];
+  const barCs = getComputedStyle(bar);
+  return {
+    // The bar's padding is uniform, so its top edge stands in for the
+    // shorthand — computed `padding` resolves to "" when the sides differ,
+    // which would silently animate it to 0.
+    bar: {
+      top: bar.getBoundingClientRect().top,
+      padding: num(barCs.paddingTop),
+      borderRadius: num(barCs.borderRadius)
+    },
+    wrap: { width: wrap.getBoundingClientRect().width },
+    input: box(input, padFont),
+    button: box(btn, padFont)
+  };
+}
 
 // Slash "functions" typed into the create bar. /overwrite is a modifier on a
 // terrain command; /cloud and /animal are standalone toggles. Typing "/" pops
@@ -33,7 +53,9 @@ const NORMAL_STYLE = {
 const SLASH_FUNCTIONS = [
   { name: '/overwrite', desc: 'Force new terrain to replace whatever is already there' },
   { name: '/cloud', desc: 'Toggle the drifting clouds on or off' },
-  { name: '/animal', desc: 'Toggle the wildlife (savanna + forest) on or off' }
+  { name: '/animal', desc: 'Toggle the wildlife (savanna + forest) on or off' },
+  { name: '/share', desc: 'Copy a code that rebuilds this world somewhere else' },
+  { name: '/load', desc: 'Paste a world code after it to build that world here' }
 ];
 
 // Would an ocean centered at (ed.centerX, ed.centerY) with ed.maxRadius bury
@@ -77,12 +99,11 @@ export default function App() {
   // Questions the player must answer before terrain applies:
   // { data, steps: ['connect'?, 'overwrite'?] } — answered front to back.
   const [pending, setPending] = useState(null);
-  // Wildlife + clouds are engine toggles mirrored into React so the sidebar
-  // switch, the /animal and /cloud functions, and the AI command all agree.
-  // Both start off.
-  const [animalsOn, setAnimalsOn] = useState(false);
+  // Wildlife + clouds are engine toggles mirrored into React so the
+  // /animal and /cloud functions and the AI command all agree. Animals
+  // start on; clouds start off.
+  const [animalsOn, setAnimalsOn] = useState(true);
   const [cloudsOn, setCloudsOn] = useState(false);
-  const [wildlifeOpen, setWildlifeOpen] = useState(false);
   // A one-shot tip that pops up and fades the first time a biome is shaped.
   const [tip, setTip] = useState(null);
   const tipTimer = useRef(null);
@@ -104,9 +125,11 @@ export default function App() {
     tipTimer.current = setTimeout(() => setTip(null), 7000);
   };
 
-  const showToast = (text, detail) => {
+  // `selectable` opts a toast out of the usual click-through behaviour, for
+  // details the player needs to be able to highlight and copy (world codes).
+  const showToast = (text, detail, selectable) => {
     clearTimeout(toastTimer.current);
-    setToast({ text, detail });
+    setToast({ text, detail, selectable });
     toastTimer.current = setTimeout(() => setToast(null), detail ? 10000 : 4000);
   };
 
@@ -126,13 +149,6 @@ export default function App() {
     clearTimeout(toastTimer.current);
     clearInterval(settleTimer.current);
     clearTimeout(tipTimer.current);
-  }, []);
-
-  // The wildlife sidebar announces itself shortly after load, sliding in from
-  // the right so players discover the animals toggle (they start off).
-  useEffect(() => {
-    const t = setTimeout(() => setWildlifeOpen(true), 1400);
-    return () => clearTimeout(t);
   }, []);
 
   // Splash-screen placeholder: only the suffix after "create" scrambles
@@ -186,34 +202,23 @@ export default function App() {
   // with getBoundingClientRect/getComputedStyle right now, synchronously,
   // and pinning them as explicit inline styles before building the
   // timeline sidesteps that race entirely.
+  //
+  // The DESTINATION is measured the same way, by briefly dropping the splash
+  // class to let the stylesheet lay the bar out at whatever the current
+  // viewport calls for, then putting it back. That keeps the transition
+  // correct at every breakpoint without this file having to restate any of
+  // the responsive geometry.
   const collapseToNormal = () => {
     const bar = barRef.current;
     const wrap = wrapRef.current;
     const input = inputRef.current;
     const btn = submitBtnRef.current;
     if (!bar || !wrap || !input || !btn) return;
-    const cs = (el) => getComputedStyle(el);
-    const num = (v) => parseFloat(v) || 0;
-    const from = {
-      bar: { top: bar.getBoundingClientRect().top, padding: num(cs(bar).padding), borderRadius: num(cs(bar).borderRadius) },
-      wrap: { width: wrap.getBoundingClientRect().width },
-      input: {
-        paddingTop: num(cs(input).paddingTop),
-        paddingBottom: num(cs(input).paddingBottom),
-        paddingLeft: num(cs(input).paddingLeft),
-        paddingRight: num(cs(input).paddingRight),
-        fontSize: num(cs(input).fontSize),
-        borderRadius: num(cs(input).borderRadius)
-      },
-      button: {
-        paddingTop: num(cs(btn).paddingTop),
-        paddingBottom: num(cs(btn).paddingBottom),
-        paddingLeft: num(cs(btn).paddingLeft),
-        paddingRight: num(cs(btn).paddingRight),
-        fontSize: num(cs(btn).fontSize),
-        borderRadius: num(cs(btn).borderRadius)
-      }
-    };
+    const from = measureBarGeometry(bar, wrap, input, btn);
+    bar.classList.remove('splash');
+    const to = measureBarGeometry(bar, wrap, input, btn);
+    bar.classList.add('splash');
+
     const targets = [bar, wrap, input, btn];
     gsap.set(bar, from.bar);
     gsap.set(wrap, from.wrap);
@@ -224,10 +229,10 @@ export default function App() {
         defaults: { duration: 1.1, ease: 'power2.inOut' },
         onComplete: () => gsap.set(targets, { clearProps: 'all' })
       })
-      .to(bar, NORMAL_STYLE.bar, 0)
-      .to(wrap, NORMAL_STYLE.wrap, 0)
-      .to(input, NORMAL_STYLE.input, 0)
-      .to(btn, NORMAL_STYLE.button, 0);
+      .to(bar, to.bar, 0)
+      .to(wrap, to.wrap, 0)
+      .to(input, to.input, 0)
+      .to(btn, to.button, 0);
   };
 
   const locked = busy || shaping || !!pending;
@@ -348,6 +353,28 @@ export default function App() {
       collapseToNormal();
     }
 
+    // World codes, handled before anything else: they're long opaque blobs,
+    // not language, so they must never reach the AI. `/share` copies one for
+    // this world; `/load <code>` rebuilds another. A bare pasted code is
+    // treated as a /load, since that's the only thing anyone would mean by it.
+    if (/^\/share$/i.test(raw)) {
+      setCommand('');
+      await copyWorldCode();
+      return;
+    }
+    if (/^\/load$/i.test(raw)) {
+      showToast('Paste a world code after /load.');
+      return;
+    }
+    // Everything after /load is the code — greedy, because a pasted code can
+    // arrive with stray whitespace in it (the decoder strips that out).
+    const loadArg = raw.match(/^\/load\s+([\s\S]+)$/i);
+    if (loadArg || looksLikeCode(raw)) {
+      setCommand('');
+      await loadWorldCode(loadArg ? loadArg[1] : raw);
+      return;
+    }
+
     // Slash "functions": /overwrite modifies a terrain command; /cloud and
     // /animal are standalone toggles handled right here (no AI round-trip).
     // All slash tokens are stripped before the prompt reaches the AI.
@@ -355,7 +382,7 @@ export default function App() {
     const toggleCloudCmd = /(^|\s)\/clouds?(?=\s|$)/i.test(raw);
     const toggleAnimalCmd = /(^|\s)\/animals?(?=\s|$)/i.test(raw);
     const text = raw
-      .replace(/(^|\s)\/(overwrite|clouds?|animals?)(?=\s|$)/gi, ' ')
+      .replace(/(^|\s)\/(overwrite|clouds?|animals?|share|load)(?=\s|$)/gi, ' ')
       .replace(/\s+/g, ' ')
       .trim();
 
@@ -414,7 +441,7 @@ export default function App() {
       // First biome of the session → the one-shot tip about the wildlife.
       if (!tipShown.current) {
         tipShown.current = true;
-        showTip('Tip: you can spawn animals through the create bar too — try /animal, or type / to see every function.');
+        showTip('Tip: animals roam the savanna and forest — toggle them with /animal, or type / to see every function.');
       }
       advance(terrainActions, mapSnap, forceOverwrite);
       setCommand('');
@@ -431,6 +458,45 @@ export default function App() {
   const undo = () => {
     if (locked) return;
     showToast(gameRef.current?.undo() ? 'Reverted the last change.' : 'Nothing to undo.');
+  };
+
+  // Copies a code that rebuilds this exact world. The code carries the
+  // world's build recipe (the seeded actions that made it) rather than its
+  // pixels, so it stays short enough to paste into a chat message and needs
+  // no server to hand out or store — see game/sharecode.js.
+  const copyWorldCode = async () => {
+    if (locked) return;
+    const code = await gameRef.current?.shareCode();
+    if (!code) {
+      showToast('Create some land first — no world to share yet.');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(code);
+      showToast('World code copied — send it to a friend to /load.', code, true);
+    } catch {
+      // Clipboard refused (insecure origin, denied permission): the toast
+      // detail shows the code so it can still be selected and copied.
+      showToast('Copy this world code:', code, true);
+    }
+  };
+
+  // Rebuilds the world from a code, replacing what's here. Decoding fully
+  // succeeds or fails before anything is torn down, so a bad code is a
+  // no-op rather than a wiped world.
+  const loadWorldCode = async (code) => {
+    setBusy(true);
+    try {
+      const count = await gameRef.current?.loadCode(code);
+      if (!count) {
+        showToast("That doesn't look like a world code.");
+        return;
+      }
+      showToast(`World loaded — ${count} ${count === 1 ? 'feature' : 'features'} rebuilt.`);
+    } finally {
+      setBusy(false);
+      inputRef.current?.blur();
+    }
   };
 
   // Renders the whole world (not just the viewport) to an image, opens it
@@ -518,6 +584,17 @@ export default function App() {
             ↗
           </button>
         )}
+        {started && (
+          <button
+            type="button"
+            className="code"
+            onClick={copyWorldCode}
+            disabled={locked}
+            title="Copy a code that rebuilds your world (/share) — paste one with /load"
+          >
+            ⧉
+          </button>
+        )}
         {slashMatches.length > 0 && (
           <div className="slash-menu">
             {slashMatches.map((f) => (
@@ -556,51 +633,12 @@ export default function App() {
         </div>
       )}
       {toast && (
-        <div className="toast">
+        <div className={toast.selectable ? 'toast selectable' : 'toast'}>
           {toast.text}
           {toast.detail && <div className="toast-detail">{toast.detail}</div>}
         </div>
       )}
       {tip && <div className="game-tip">{tip}</div>}
-      {!wildlifeOpen && (
-        <button
-          type="button"
-          className="wildlife-handle"
-          onClick={() => setWildlifeOpen(true)}
-          title="Wildlife"
-          aria-label="Show wildlife panel"
-        >
-          🐾
-        </button>
-      )}
-      <div className={wildlifeOpen ? 'wildlife-panel open' : 'wildlife-panel'}>
-        <div className="wildlife-body">
-          <div className="wildlife-head">
-            <span className="wildlife-title">Wildlife</span>
-            <button type="button" className="wildlife-close" onClick={() => setWildlifeOpen(false)} title="Hide">
-              ×
-            </button>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={animalsOn}
-            className={animalsOn ? 'wildlife-switch on' : 'wildlife-switch'}
-            onClick={() => toggleAnimals(!animalsOn)}
-          >
-            <span className="wildlife-switch-label">Animals</span>
-            <span className="wildlife-track">
-              <span className="wildlife-knob" />
-            </span>
-          </button>
-          <p className="wildlife-hint">
-            Lions &amp; zebras roam the <b>savanna</b>; wolves, deer &amp; bears the <b>forest</b>. Toggle them here or through the create bar.
-          </p>
-          <p className="wildlife-hint">
-            Type <b>/</b> in the bar to view functions.
-          </p>
-        </div>
-      </div>
     </>
   );
 }

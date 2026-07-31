@@ -8,6 +8,10 @@ body {
   height: 100%;
   overflow: hidden;
   font-family: 'Segoe UI', system-ui, sans-serif;
+  /* The world is a fixed, full-viewport canvas, so there is nothing to
+     scroll — stop mobile browsers from rubber-banding or pull-to-refreshing
+     over the top of it. */
+  overscroll-behavior: none;
 }
 
 .game-canvas {
@@ -15,17 +19,22 @@ body {
   position: fixed;
   inset: 0;
   image-rendering: pixelated;
+  /* No scrolling or double-tap zoom on the play surface. */
+  touch-action: none;
 }
 
 .command-bar {
   position: fixed;
-  top: 40px;
+  top: calc(40px + env(safe-area-inset-top, 0px));
   left: 50%;
   transform: translateX(-50%);
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 6px;
+  /* Never wider than the screen: the input absorbs the difference (see
+     .input-wrap) so the buttons stay put and nothing is pushed off-edge. */
+  max-width: calc(100vw - 16px);
   background: rgba(255, 255, 255, 0.16);
   backdrop-filter: blur(16px) saturate(1.5);
   -webkit-backdrop-filter: blur(16px) saturate(1.5);
@@ -38,7 +47,14 @@ body {
 
 .input-wrap {
   position: relative;
+  /* Preferred width, but it yields first when the bar runs out of room.
+     min-width: 0 is what lets a flex item shrink below its content, and
+     max-width caps the splash transition's animated inline width so it can
+     never overflow the bar mid-animation. */
   width: 440px;
+  max-width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .command-bar input {
@@ -73,6 +89,8 @@ body {
 }
 
 .command-bar button {
+  /* Buttons hold their size; the input is the only thing that gives. */
+  flex: none;
   padding: 8px 14px;
   border: none;
   border-radius: 12px;
@@ -89,7 +107,8 @@ body {
 }
 
 .command-bar button.undo,
-.command-bar button.share {
+.command-bar button.share,
+.command-bar button.code {
   background: rgba(255, 255, 255, 0.3);
   color: #17220f;
   font-size: 16px;
@@ -104,6 +123,7 @@ body {
   padding: 14px;
   border-radius: 26px;
   background: rgba(255, 255, 255, 0.14);
+  max-width: calc(100vw - 24px);
 }
 
 .command-bar.splash .input-wrap {
@@ -179,8 +199,8 @@ body {
 
 .zoom-bar {
   position: fixed;
-  right: 20px;
-  bottom: 20px;
+  right: calc(20px + env(safe-area-inset-right, 0px));
+  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -227,6 +247,22 @@ body {
   text-align: center;
 }
 
+/* A toast carrying a world code has to be reachable by the mouse — the
+   default toast is click-through — so the code can be highlighted and copied
+   by hand wherever the clipboard API isn't available. */
+.toast.selectable {
+  pointer-events: auto;
+  user-select: text;
+  border-radius: 16px;
+}
+
+.toast.selectable .toast-detail {
+  max-height: 132px;
+  overflow-y: auto;
+  user-select: all;
+  cursor: text;
+}
+
 .toast-detail {
   font-size: 11px;
   font-family: monospace;
@@ -247,162 +283,6 @@ body {
     opacity: 1;
     transform: translate(-50%, 0);
   }
-}
-
-/* Wildlife sidebar — slides in from the right edge to point players at the
-   animals toggle (animals start off). Dark glass to stay legible over the
-   bright map, matching the toast/confirm popups. When hidden, a small tab
-   (.wildlife-handle) pokes out at the edge to bring it back. */
-.wildlife-panel {
-  position: fixed;
-  top: 50%;
-  right: 0;
-  transform: translate(100%, -50%);
-  transition: transform 0.55s cubic-bezier(0.22, 1, 0.36, 1);
-  z-index: 12;
-}
-
-.wildlife-panel.open {
-  transform: translate(0, -50%);
-}
-
-.wildlife-body {
-  width: 236px;
-  padding: 16px 18px 18px;
-  background: rgba(20, 24, 18, 0.55);
-  backdrop-filter: blur(16px) saturate(1.5);
-  -webkit-backdrop-filter: blur(16px) saturate(1.5);
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-right: none;
-  border-radius: 18px 0 0 18px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
-  color: #f2f6ec;
-}
-
-.wildlife-handle {
-  position: fixed;
-  top: 50%;
-  right: 0;
-  transform: translateY(-50%);
-  width: 40px;
-  height: 54px;
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-right: none;
-  border-radius: 14px 0 0 14px;
-  background: rgba(20, 24, 18, 0.55);
-  backdrop-filter: blur(16px) saturate(1.5);
-  -webkit-backdrop-filter: blur(16px) saturate(1.5);
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
-  font-size: 22px;
-  line-height: 1;
-  cursor: pointer;
-  z-index: 12;
-  animation: wildlife-tab-in 0.4s ease-out;
-}
-
-@keyframes wildlife-tab-in {
-  from {
-    transform: translate(100%, -50%);
-    opacity: 0;
-  }
-  to {
-    transform: translate(0, -50%);
-    opacity: 1;
-  }
-}
-
-.wildlife-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 14px;
-}
-
-.wildlife-title {
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.wildlife-close {
-  border: none;
-  background: transparent;
-  color: rgba(242, 246, 236, 0.7);
-  font-size: 20px;
-  line-height: 1;
-  padding: 0 2px;
-  cursor: pointer;
-}
-
-.wildlife-close:hover {
-  color: #f2f6ec;
-}
-
-.wildlife-switch {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  gap: 12px;
-  padding: 9px 11px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.06);
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
-}
-
-.wildlife-switch-label {
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.wildlife-track {
-  position: relative;
-  flex: none;
-  width: 42px;
-  height: 24px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.2);
-  transition: background 0.25s;
-}
-
-.wildlife-switch.on .wildlife-track {
-  background: rgba(139, 216, 78, 0.9);
-}
-
-.wildlife-knob {
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background: #fff;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
-  transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.wildlife-switch.on .wildlife-knob {
-  transform: translateX(18px);
-}
-
-.wildlife-hint {
-  margin: 12px 0 0;
-  font-size: 12px;
-  line-height: 1.5;
-  color: rgba(242, 246, 236, 0.78);
-}
-
-.wildlife-hint b {
-  color: #d9c565;
-  font-weight: 600;
-}
-
-.wildlife-hint + .wildlife-hint {
-  margin-top: 8px;
-  padding-top: 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.12);
 }
 
 /* "/" function menu — drops below the create bar while a slash token is being
@@ -460,7 +340,7 @@ body {
    for one-off nudges like the wildlife/create-bar hint on the first biome. */
 .game-tip {
   position: fixed;
-  bottom: 26px;
+  bottom: calc(26px + env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
   max-width: 78vw;
@@ -486,5 +366,181 @@ body {
   to {
     opacity: 1;
     transform: translate(-50%, 0);
+  }
+}
+
+/* ===================================================================== */
+/* Responsive                                                            */
+/*                                                                       */
+/* The world itself needs no breakpoints — the canvas fills the viewport */
+/* and the engine scales the whole scene down on small screens (see      */
+/* SCENE_STEPS in game/engine.js), so a phone shows a comparable slice of */
+/* world rather than a close-up. What follows is only the UI on top.     */
+/* ===================================================================== */
+
+/* The confirm popup normally sits to the RIGHT of the create bar, which
+   only works while there is a screen's worth of room beside it. Below that,
+   move it to the bottom center: out of the bar's way, clear of the toast,
+   and close to the thumb on a phone. */
+@media (max-width: 900px) {
+  .confirm-pop {
+    top: auto;
+    bottom: calc(84px + env(safe-area-inset-bottom, 0px));
+    left: 50%;
+    transform: translateX(-50%);
+    /* pop-in animates a bare translateY, which would drop the centering. */
+    animation-name: pop-in-centered;
+  }
+}
+
+@keyframes pop-in-centered {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* Phones and small windows. */
+@media (max-width: 720px) {
+  .command-bar {
+    top: calc(14px + env(safe-area-inset-top, 0px));
+    gap: 4px;
+    padding: 5px;
+  }
+
+  .command-bar button {
+    padding: 8px 11px;
+    font-size: 13px;
+  }
+
+  .command-bar button.undo,
+  .command-bar button.share,
+  .command-bar button.code {
+    padding: 8px 9px;
+    font-size: 15px;
+  }
+
+  /* 16px is the threshold below which iOS Safari zooms the whole page in
+     when a field takes focus — which on a fixed full-screen canvas leaves
+     the player stranded at the wrong scale with no way to scroll back. */
+  .command-bar input,
+  .placeholder-overlay {
+    padding: 9px 12px;
+    font-size: 16px;
+  }
+
+  .command-bar.splash {
+    top: 22vh;
+    padding: 10px;
+    border-radius: 22px;
+  }
+
+  .command-bar.splash input,
+  .command-bar.splash .placeholder-overlay {
+    padding: 14px 18px;
+    font-size: 19px;
+  }
+
+  .command-bar.splash button[type='submit'] {
+    padding: 13px 20px;
+    font-size: 17px;
+  }
+
+  .toast {
+    top: calc(72px + env(safe-area-inset-top, 0px));
+    font-size: 12px;
+    max-width: calc(100vw - 24px);
+  }
+
+  .zoom-bar {
+    right: calc(12px + env(safe-area-inset-right, 0px));
+    bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .zoom-bar button {
+    width: 40px;
+    height: 40px;
+    font-size: 20px;
+  }
+
+  /* Keep the tip clear of the zoom buttons in the corner. */
+  .game-tip {
+    max-width: calc(100vw - 90px);
+    font-size: 12px;
+    padding: 9px 14px;
+  }
+
+  /* The input is narrow once the buttons take their share, which would
+     squeeze the function list into a sliver. Anchor the menu to the input's
+     left edge but let it run the width of the screen instead. */
+  .slash-menu {
+    right: auto;
+    width: calc(100vw - 32px);
+  }
+}
+
+/* Narrow phones: the slash menu's name + description no longer fit on one
+   line, so stack them. */
+@media (max-width: 480px) {
+  /* Claw a little more room back for the input — it is the one control that
+     actually needs the space. */
+  .command-bar button.undo,
+  .command-bar button.share,
+  .command-bar button.code {
+    padding: 8px 8px;
+    font-size: 14px;
+  }
+
+  .slash-item {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: 7px 9px;
+  }
+
+  .slash-desc {
+    font-size: 11px;
+  }
+
+  .toast-detail {
+    max-height: 72px;
+  }
+
+  .toast.selectable .toast-detail {
+    max-height: 96px;
+  }
+}
+
+/* Short viewports — landscape phones, and desktop windows dragged flat.
+   Height is the scarce axis here, so the splash comes up and everything
+   vertical tightens. */
+@media (max-height: 560px) {
+  .command-bar.splash {
+    top: 10vh;
+    padding: 8px;
+  }
+
+  .command-bar.splash input,
+  .command-bar.splash .placeholder-overlay {
+    padding: 11px 15px;
+    font-size: 17px;
+  }
+
+  .command-bar.splash button[type='submit'] {
+    padding: 11px 17px;
+    font-size: 15px;
+  }
+
+  .game-tip {
+    bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    padding: 7px 14px;
+  }
+
+  .confirm-pop {
+    bottom: calc(64px + env(safe-area-inset-bottom, 0px));
   }
 }

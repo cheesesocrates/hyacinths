@@ -77,6 +77,12 @@ const GameCanvas = forwardRef(function GameCanvas(_props, ref) {
     },
     renderFullMap() {
       return engineRef.current ? engineRef.current.renderFullMap() : null;
+    },
+    shareCode() {
+      return engineRef.current ? engineRef.current.shareCode() : Promise.resolve(null);
+    },
+    loadCode(code) {
+      return engineRef.current ? engineRef.current.loadCode(code) : Promise.resolve(null);
     }
   }));
 
