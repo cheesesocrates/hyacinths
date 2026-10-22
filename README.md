@@ -1,6 +1,8 @@
 # Hyacinths
 
-A 2D terrain-shaping game where you walk a 16x16 pixel character across an infinite procedural world. Use **WASD** to move (character stays centered; world scrolls beneath you), and type natural-language terrain commands into the top bar to shape your surroundings. The AI (Gemini by default) replies with generation parameters; the client-side noise engine grows terrain frame-by-frame from your current position.
+**Play it: [hyacinths.vercel.app](https://hyacinths.vercel.app)** (bring your own AI key, or play offline)
+
+A 2D terrain-shaping game where you walk a 16x16 pixel character across an infinite procedural world. Use **WASD** to move (character stays centered; world scrolls beneath you), and type natural-language terrain commands into the top bar to shape your surroundings. An AI model (from whichever provider you bring a key for) replies with generation parameters; the client-side noise engine grows terrain frame-by-frame from your current position.
 
 The world is infinite, but you're bounded: you can only wander ~300 pixels into the white void beyond solid ground, forcing you to shape terrain with commands to explore further. **Zoom** with the mouse wheel, `+`/`−` keys, or on-screen buttons (bottom right, ~0.35x to 2.5x). **Undo** (↶ button) reverts up to 10 generations.
 
@@ -88,3 +90,7 @@ It's a plain Vite static build (`npm run build` → `dist/`), so any static host
 - `src/App.jsx` — command bar, `/` function menu, toast + transient tips, wildlife panel, undo/zoom/share/code/key controls, and the 🔑 key panel. The splash→normal GSAP transition measures both ends off the live elements rather than hardcoding pixel targets, so the stylesheet stays the only place responsive geometry is defined.
 - `src/styles.css` — glass UI, with the responsive rules collected in one block at the bottom.
 - `assets/` — character sprites; `assets/nature_pack/` — terrain sprites (tree, acacia, cactus, mountain, snowtree) and animals (`savanna/lion`, `savanna/zebra`, `forest/wolf`, `forest/deer`, `forest/bear`). Any PNG under `nature_pack/**` auto-loads, grouped by name.
+
+## License
+
+[MIT](LICENSE) © 2026 Ayan Arsalan
