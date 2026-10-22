@@ -3,6 +3,9 @@ import { gsap } from 'gsap';
 import { animate, scrambleText } from 'animejs';
 import GameCanvas from './game/GameCanvas';
 import { looksLikeCode } from './game/sharecode';
+import { requestTerrain } from './ai/terrain';
+import { loadKeys, saveKeys, clearKeys } from './ai/keys';
+import { PROVIDERS, PROVIDER_BY_ID, isUsable, usableProviders } from './ai/providers';
 
 // Rotating splash-screen placeholder: "create" stays fixed and never
 // scrambles — only this suffix (one per supported terrain) animates.
@@ -108,6 +111,17 @@ export default function App() {
   const [tip, setTip] = useState(null);
   const tipTimer = useRef(null);
   const tipShown = useRef(false);
+  const keyTipShown = useRef(false);
+  // The player's own provider choice and API keys (bring-your-own-key — see
+  // ai/keys.js), and the key panel's working copy while it's open (null when
+  // closed). Edits only land in `keys` on save, so cancelling leaves the live
+  // keys untouched.
+  const [keys, setKeys] = useState(loadKeys);
+  const [keyDraft, setKeyDraft] = useState(null);
+  const activeProvider = usableProviders(keys)[0] ?? null;
+  const hasKey = !!activeProvider;
+  const draftProvider = keyDraft ? PROVIDER_BY_ID[keyDraft.provider] : null;
+  const draftBackups = keyDraft ? usableProviders(keyDraft).filter((p) => p !== draftProvider) : [];
 
   const toggleAnimals = (on) => {
     setAnimalsOn(on);
@@ -411,13 +425,8 @@ export default function App() {
     const mapSnap = gameRef.current.mapSnapshot();
     setBusy(true);
     try {
-      const res = await fetch('/api/terrain', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ command: text, charX: x, charY: y, map: mapSnap })
-      });
-      const data = await res.json();
-      if (data.debug) console.error('[terrain api]', data.debug);
+      const data = await requestTerrain({ command: text, charX: x, charY: y, map: mapSnap }, keys);
+      if (data.debug) console.error('[terrain ai]', data.debug);
       const note = data.notification || 'The land shifts quietly.';
       // engine_data may be a single action or an array of them ("desert and
       // ocean"). Pull out standalone toggles and apply them inline; keep the
@@ -438,15 +447,19 @@ export default function App() {
       }
 
       showToast(forceOverwrite ? note + ' (overwriting)' : note, data.debug);
-      // First biome of the session → the one-shot tip about the wildlife.
-      if (!tipShown.current) {
+      // Keyless players are on the offline parser — point them at the key
+      // panel once. Otherwise the first biome gets the one-shot wildlife tip.
+      if (!hasKey && !keyTipShown.current) {
+        keyTipShown.current = true;
+        showTip('Tip: this is offline mode — bring your own AI key (Gemini, OpenAI, Claude, Groq…) with 🔑 for the full AI.');
+      } else if (!tipShown.current) {
         tipShown.current = true;
         showTip('Tip: animals roam the savanna and forest — toggle them with /animal, or type / to see every function.');
       }
       advance(terrainActions, mapSnap, forceOverwrite);
       setCommand('');
     } catch {
-      showToast('Could not reach the terrain server.');
+      showToast('Something went wrong shaping that — try again.');
     } finally {
       setBusy(false);
       inputRef.current?.blur();
@@ -539,6 +552,38 @@ export default function App() {
     }
   };
 
+  // Key panel: opens on a copy of the live settings; save commits them (and
+  // persists where storage allows), forget wipes every key from this browser.
+  const openKeys = () => setKeyDraft({ ...keys, keys: { ...keys.keys }, models: { ...keys.models } });
+  const closeKeys = () => setKeyDraft(null);
+  // 'keys' and 'models' are per-provider maps, so those edits land on the
+  // provider currently shown; 'provider' and 'customUrl' are plain fields.
+  const editDraft = (field) => (e) => {
+    const { value } = e.target;
+    setKeyDraft((d) =>
+      field === 'keys' || field === 'models'
+        ? { ...d, [field]: { ...d[field], [d.provider]: value } }
+        : { ...d, [field]: value }
+    );
+  };
+  const submitKeys = (e) => {
+    e.preventDefault();
+    const { settings, persisted } = saveKeys(keyDraft);
+    setKeys(settings);
+    setKeyDraft(null);
+    // Name whoever will actually answer — the chosen provider, or the first
+    // backup when the chosen one has no key yet.
+    const [first] = usableProviders(settings);
+    if (!first) showToast('No key set — playing in offline mode.');
+    else if (persisted) showToast(`Using ${first.name} — keys stay in this browser only.`);
+    else showToast(`Using ${first.name} for this visit — this browser can't store keys.`);
+  };
+  const forgetKeys = () => {
+    setKeys(clearKeys());
+    setKeyDraft(null);
+    showToast('Keys forgotten — nothing is stored in this browser now.');
+  };
+
   // The "/" menu shows while the current token is a slash query — typing "/"
   // lists every function; "/cl" filters to /cloud, and so on.
   const slashQuery = (() => {
@@ -626,10 +671,120 @@ export default function App() {
           </button>
         </div>
       )}
-      {started && (
-        <div className="zoom-bar">
-          <button type="button" onClick={() => zoom(1.2)} title="Zoom in (scroll up / +)">+</button>
-          <button type="button" onClick={() => zoom(1 / 1.2)} title="Zoom out (scroll down / -)">−</button>
+      <div className="zoom-bar">
+        {/* Shown from the splash on, so keyless players can find it before
+            their first command. Locked while a request or question is open:
+            the confirm popup's Enter/Backspace keys would hijack typing. */}
+        <button
+          type="button"
+          className={hasKey ? 'key' : 'key needs-key'}
+          onClick={openKeys}
+          disabled={busy || !!pending}
+          title={
+            hasKey
+              ? `AI: ${activeProvider.name} — your key is stored in this browser only`
+              : 'Add your own AI key — offline mode until you do'
+          }
+        >
+          {hasKey ? '🔑' : '🔑 add AI key'}
+        </button>
+        {started && (
+          <>
+            <button type="button" onClick={() => zoom(1.2)} title="Zoom in (scroll up / +)">+</button>
+            <button type="button" onClick={() => zoom(1 / 1.2)} title="Zoom out (scroll down / -)">−</button>
+          </>
+        )}
+      </div>
+      {keyDraft && (
+        // Wheel events stop here so scrolling the panel doesn't zoom the world
+        // underneath (GameCanvas listens for the wheel on window).
+        <div
+          className="key-backdrop"
+          onMouseDown={(e) => e.target === e.currentTarget && closeKeys()}
+          onWheel={(e) => e.stopPropagation()}
+        >
+          <form className="key-panel" onSubmit={submitKeys} onKeyDown={(e) => e.key === 'Escape' && closeKeys()}>
+            <h2>Bring your own key</h2>
+            <p>
+              Hyacinths shapes terrain from what you type using an AI model from whichever provider you pick, with
+              your own API key. Keys are kept only in this browser and sent straight to that provider. There is no
+              Hyacinths server, so nobody else ever sees them.
+            </p>
+            <label>
+              <span className="key-label">AI provider</span>
+              <select value={keyDraft.provider} onChange={editDraft('provider')}>
+                {PROVIDERS.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {isUsable(keyDraft, p) ? `${p.name} ✓` : p.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {draftProvider.custom && (
+              <label>
+                <span className="key-label">Base URL</span>
+                <input
+                  type="url"
+                  value={keyDraft.customUrl}
+                  onChange={editDraft('customUrl')}
+                  placeholder="https://api.example.com/v1"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </label>
+            )}
+            <label>
+              <span className="key-label">
+                <span>API key {draftProvider.custom && <em>if it needs one</em>}</span>
+                {draftProvider.keyUrl && (
+                  <a href={draftProvider.keyUrl} target="_blank" rel="noreferrer">
+                    get a key ↗
+                  </a>
+                )}
+              </span>
+              <input
+                type="password"
+                value={keyDraft.keys[keyDraft.provider] ?? ''}
+                onChange={editDraft('keys')}
+                placeholder="paste your key"
+                autoComplete="off"
+                spellCheck={false}
+                autoFocus
+              />
+            </label>
+            <label>
+              <span className="key-label">
+                <span>Model {!draftProvider.custom && <em>optional</em>}</span>
+              </span>
+              <input
+                value={keyDraft.models[keyDraft.provider] ?? ''}
+                onChange={editDraft('models')}
+                placeholder={draftProvider.defaultModel || 'model name'}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+            {draftBackups.length > 0 && (
+              <p className="key-note">
+                If {draftProvider.name} fails, your other saved {draftBackups.length === 1 ? 'key is' : 'keys are'}{' '}
+                tried next: {draftBackups.map((p) => p.name).join(', ')}.
+              </p>
+            )}
+            <p className="key-note">No key? The game still plays, using a simple offline keyword parser.</p>
+            <div className="key-actions">
+              {hasKey && (
+                <button type="button" className="forget" onClick={forgetKeys}>
+                  forget keys
+                </button>
+              )}
+              <button type="button" className="cancel" onClick={closeKeys}>
+                cancel
+              </button>
+              <button type="submit" className="save">
+                save
+              </button>
+            </div>
+          </form>
         </div>
       )}
       {toast && (

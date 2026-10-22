@@ -1,27 +1,10 @@
-import 'dotenv/config';
-import express from 'express';
 import { SYSTEM_PROMPT } from './systemPrompt.js';
+import { modelFor, usableProviders } from './providers.js';
 
-const app = express();
-app.use(express.json());
-
-const PORT = Number(process.env.PORT) || 3001;
-const MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
-const API_KEY = process.env.GEMINI_API_KEY;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
-
-// Optional Gemini "thinking" budget. Left UNSET by default: several models
-// (e.g. gemini-flash-lite-latest) reject an explicit thinkingBudget of 0
-// with a 400 INVALID_ARGUMENT, and the lite/default models don't think
-// anyway — so we simply omit thinkingConfig unless a budget is configured.
-// Set GEMINI_THINKING_BUDGET (e.g. 0 to force-disable thinking on a model
-// that supports it, or -1 for dynamic) only if your chosen model accepts it.
-const _rawThinkingBudget = process.env.GEMINI_THINKING_BUDGET;
-const THINKING_BUDGET =
-  _rawThinkingBudget != null && _rawThinkingBudget.trim() !== '' && Number.isFinite(Number(_rawThinkingBudget))
-    ? Number(_rawThinkingBudget)
-    : null;
+// Runs entirely in the player's browser. There is no backend: each request
+// goes straight from here to the provider the player picked (ai/providers.js)
+// with the player's OWN key (ai/keys.js), so a deployed copy of the game
+// never holds anyone's key.
 
 const TERRAINS = new Set(['grass', 'desert', 'forest', 'river', 'lake', 'tundra', 'ocean', 'savannah', 'mountain']);
 
@@ -133,56 +116,125 @@ function userContent(command, charX, charY, map) {
   return content;
 }
 
-async function askGemini(command, charX, charY, map) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
+// Every supported provider wraps errors as { error: { message } }. The
+// sentence inside ("API key not valid…") is what a player pasting a wrong key
+// needs to see; anything that isn't that envelope comes through as raw text.
+async function errorText(res) {
+  const text = await res.text();
+  try {
+    return JSON.parse(text).error?.message || text;
+  } catch {
+    return text;
+  }
+}
+
+async function askGemini(p, settings, command, charX, charY, map) {
+  const model = encodeURIComponent(modelFor(settings, p));
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    // The key rides in a header rather than the ?key= query string, so it
+    // never lands in a URL (history, logs, extensions that record requests).
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': settings.keys[p.id] },
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
       contents: [{ role: 'user', parts: [{ text: JSON.stringify(userContent(command, charX, charY, map)) }] }],
       generationConfig: {
         temperature: 0.9,
         responseMimeType: 'application/json',
-        maxOutputTokens: 4096,
-        // Only include a thinking budget when one is explicitly configured;
-        // otherwise omit it entirely (see THINKING_BUDGET above).
-        ...(THINKING_BUDGET !== null ? { thinkingConfig: { thinkingBudget: THINKING_BUDGET } } : {})
+        maxOutputTokens: 4096
+        // No thinkingConfig on purpose: several models (e.g.
+        // gemini-flash-lite-latest) reject an explicit thinkingBudget of 0
+        // with a 400 INVALID_ARGUMENT, and the lite/default models don't
+        // think anyway.
       }
     })
   });
-  if (!res.ok) throw new Error(`Gemini ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`${p.name} ${res.status}: ${await errorText(res)}`);
   const data = await res.json();
-  const text = (data.candidates?.[0]?.content?.parts ?? []).map((p) => p.text ?? '').join('');
+  const text = (data.candidates?.[0]?.content?.parts ?? []).map((part) => part.text ?? '').join('');
   try {
     return extractFirstJson(text);
   } catch (e) {
-    throw new Error(`(finishReason: ${data.candidates?.[0]?.finishReason ?? 'unknown'}) ${e.message}`);
+    throw new Error(`${p.name} (finishReason: ${data.candidates?.[0]?.finishReason ?? 'unknown'}) ${e.message}`);
   }
 }
 
-async function askGroq(command, charX, charY, map) {
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+async function askAnthropic(p, settings, command, charX, charY, map) {
+  const model = modelFor(settings, p);
+  // Two extras only for the default model, which is known to accept them:
+  // low effort keeps an always-thinking model quick for a small JSON reply,
+  // and "default" fallbacks re-run a safety decline on a model Anthropic
+  // picks instead of failing. A player-chosen model gets the plain request,
+  // which every Claude model accepts. No temperature either way — current
+  // Claude models reject sampling parameters.
+  const tuned = model === p.defaultModel;
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${GROQ_API_KEY}`,
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
+      'x-api-key': settings.keys[p.id],
+      'anthropic-version': '2023-06-01',
+      // Anthropic's required opt-in for calls made straight from a web page.
+      'anthropic-dangerous-direct-browser-access': 'true',
+      ...(tuned ? { 'anthropic-beta': 'server-side-fallback-2026-07-01' } : {})
     },
     body: JSON.stringify({
-      model: GROQ_MODEL,
+      model,
+      max_tokens: 16000,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: JSON.stringify(userContent(command, charX, charY, map)) }],
+      ...(tuned ? { output_config: { effort: 'low' }, fallbacks: 'default' } : {})
+    })
+  });
+  if (!res.ok) throw new Error(`${p.name} ${res.status}: ${await errorText(res)}`);
+  const data = await res.json();
+  if (data.stop_reason === 'refusal') {
+    throw new Error(`${p.name} declined the request (${data.stop_details?.category ?? 'refusal'})`);
+  }
+  // Thinking blocks come first and carry no answer — only text blocks do.
+  const text = (data.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('');
+  try {
+    return extractFirstJson(text);
+  } catch (e) {
+    throw new Error(`${p.name} (stop_reason: ${data.stop_reason ?? 'unknown'}) ${e.message}`);
+  }
+}
+
+// OpenAI, Groq, OpenRouter, Mistral, DeepSeek and custom endpoints all share
+// the chat-completions shape; per-provider quirks are flags in providers.js.
+async function askOpenAICompatible(p, settings, command, charX, charY, map) {
+  const key = settings.keys[p.id];
+  // A custom base URL may be pasted with or without the endpoint path.
+  const base = (p.custom ? settings.customUrl : p.baseUrl).replace(/\/+$/, '');
+  const url = /\/chat\/completions$/.test(base) ? base : `${base}/chat/completions`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(key ? { Authorization: `Bearer ${key}` } : {})
+    },
+    body: JSON.stringify({
+      model: modelFor(settings, p),
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: JSON.stringify(userContent(command, charX, charY, map)) }
       ],
-      temperature: 0.9,
-      response_format: { type: 'json_object' }
+      ...(p.temperature === false ? {} : { temperature: 0.9 }),
+      ...(p.jsonMode === false ? {} : { response_format: { type: 'json_object' } })
     })
   });
-  if (!res.ok) throw new Error(`Groq ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`${p.name} ${res.status}: ${await errorText(res)}`);
   const data = await res.json();
   const text = data.choices?.[0]?.message?.content ?? '';
-  return extractFirstJson(text);
+  try {
+    return extractFirstJson(text);
+  } catch (e) {
+    throw new Error(`${p.name} ${e.message}`);
+  }
 }
+
+const ASK = { gemini: askGemini, anthropic: askAnthropic, openai: askOpenAICompatible };
 
 // Clamps ONE engine_data action from the model into exactly what the engine
 // accepts, or returns null if it's neither a supported terrain nor a toggle.
@@ -518,48 +570,32 @@ function offlineFallback(command, charX, charY, apiFailed, debug) {
   return result;
 }
 
-app.post('/api/terrain', async (req, res) => {
-  const body = req.body ?? {};
-  const command = String(body.command ?? '');
-  const charX = Math.round(Number(body.charX)) || 0;
-  const charY = Math.round(Number(body.charY)) || 0;
-  const map = validateMap(body.map);
+// Turns one player command into { notification, engine_data, debug? }. Tries
+// the player's chosen provider, then any other provider they saved a key for,
+// then the offline parser. `settings` is the player's own key store (see
+// ai/keys.js). Never throws: every failure path lands on the offline fallback.
+export async function requestTerrain(body, settings) {
+  const command = String(body?.command ?? '');
+  const charX = Math.round(Number(body?.charX)) || 0;
+  const charY = Math.round(Number(body?.charY)) || 0;
+  const map = validateMap(body?.map);
 
-  if (!API_KEY && !GROQ_API_KEY) {
-    res.json(offlineFallback(command, charX, charY, false));
-    return;
-  }
+  const providers = usableProviders(settings);
+  if (!providers.length) return offlineFallback(command, charX, charY, false);
 
   const errors = [];
-
-  if (API_KEY) {
+  for (const p of providers) {
     try {
-      const raw = await askGemini(command, charX, charY, map);
-      res.json(sanitize(raw, charX, charY));
-      return;
+      const raw = await ASK[p.kind](p, settings, command, charX, charY, map);
+      return sanitize(raw, charX, charY);
     } catch (err) {
-      console.error('[gemini]', err.message);
-      errors.push(`gemini: ${err.message}`);
+      // A network-level failure (offline, blocked, CORS) has no status line;
+      // name the provider so the toast still says which one fell over.
+      const message = err.message.startsWith(p.name) ? err.message : `${p.name}: ${err.message}`;
+      console.error(`[${p.id}]`, message);
+      errors.push(message);
     }
   }
 
-  if (GROQ_API_KEY) {
-    try {
-      const raw = await askGroq(command, charX, charY, map);
-      res.json(sanitize(raw, charX, charY));
-      return;
-    } catch (err) {
-      console.error('[groq]', err.message);
-      errors.push(`groq: ${err.message}`);
-    }
-  }
-
-  res.json(offlineFallback(command, charX, charY, true, errors.join(' | ')));
-});
-
-app.listen(PORT, () => {
-  console.log(`Terrain server listening on http://localhost:${PORT}`);
-  if (!API_KEY && !GROQ_API_KEY) {
-    console.warn('No GEMINI_API_KEY or GROQ_API_KEY set — running in offline keyword mode. Copy .env.example to .env and add your key.');
-  }
-});
+  return offlineFallback(command, charX, charY, true, errors.join(' | '));
+}

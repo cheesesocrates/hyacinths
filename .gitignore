@@ -1,3 +1,7 @@
 node_modules/
 dist/
+.vercel/
+# Local env files — the app reads none (keys are entered in-game), but keep
+# any old ones out of the repo.
 .env
+.env.*

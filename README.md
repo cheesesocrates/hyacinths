@@ -40,27 +40,51 @@ Movement is still keyboard (WASD) — there are no touch controls, so a phone ca
 
 Each command also sends the AI a text-grid snapshot of the world around you — a 120x64 character map (`'.'` void, `'G'` grass, `'D'` desert, `'F'` forest, `'R'` river/lake, `'T'` tundra, `'I'` ice, `'O'` ocean, `'S'` savannah, `'M'` mountains, `'P'` player) plus world-coordinate origin, so it places terrain relative to what already exists. It is not an image — just text rows.
 
+### Bring your own key
+
+Hyacinths ships with **no API key**. Every player uses their own, from whichever provider they like: hit the **🔑** button (bottom right, also on the splash screen), pick a provider, and paste a key. Each provider can also take a model override.
+
+| Provider | Default model | Get a key |
+| --- | --- | --- |
+| Google Gemini | `gemini-flash-latest` | [aistudio.google.com](https://aistudio.google.com/apikey) (free tier) |
+| OpenAI | `gpt-4.1-mini` | [platform.openai.com](https://platform.openai.com/api-keys) |
+| Anthropic Claude | `claude-opus-5-5` | [console.anthropic.com](https://console.anthropic.com/settings/keys) |
+| Groq | `llama-3.3-70b-versatile` | [console.groq.com](https://console.groq.com/keys) (free tier) |
+| OpenRouter | `meta-llama/llama-3.3-70b-instruct` | [openrouter.ai](https://openrouter.ai/keys) (hundreds of models) |
+| Mistral | `mistral-small-latest` | [console.mistral.ai](https://console.mistral.ai/api-keys) |
+| DeepSeek | `deepseek-chat` | [platform.deepseek.com](https://platform.deepseek.com/api_keys) |
+| Custom | — | any OpenAI-compatible endpoint (Together, Fireworks, xAI, local Ollama/LM Studio…): give it a base URL and model; the key is optional |
+
+There is no backend. The game is a static site, and the browser calls the provider directly with your key:
+
+- Keys are kept only in your browser's `localStorage`, one per provider. **forget keys** in the panel wipes them all.
+- Each key goes only to its own provider. Gemini's goes in the `x-goog-api-key` header, never the URL; Anthropic's goes in `x-api-key`; the rest are sent as bearer tokens. The site's Content-Security-Policy (`vercel.json`) allows scripts only from the site itself, so nothing third-party can run on the page and read them.
+- A custom endpoint must allow cross-origin requests from the site. For a local server, that means e.g. setting `OLLAMA_ORIGINS`.
+
 ### Providers & Fallback
 
-**Gemini** is the primary provider. If you set `GROQ_API_KEY`, **Groq** serves as fallback. Without an API key, an offline keyword parser activates as the last resort (tagged `[offline mode]` in notifications). Full API errors surface in the toast.
+The provider you pick in the panel answers first. If it fails (bad key, rate limit, outage), every **other** provider you've saved a key for is tried next, in the table's order. With no key, or when every provider fails, an offline keyword parser keeps the game playable (tagged `[offline mode]` in notifications). Provider errors, such as `API key not valid`, surface in the toast.
 
 ## Setup
 
 ```
 npm install
-copy .env.example .env    # then paste your Gemini API key into .env
 npm run dev
 ```
 
-Open http://localhost:5173.
+Open http://localhost:5173 and add your key with the 🔑 button. There is no `.env` to fill in: the app reads no environment variables, so a build can never bake a key in.
 
-Without an API key the server falls back to a simple offline keyword parser, so the game still works — notifications are tagged `[offline mode]`.
+## Deploying
+
+It's a plain Vite static build (`npm run build` → `dist/`), so any static host works. On Vercel, import the repo (or run `vercel --prod`) and leave **Environment Variables empty**, since nothing reads them. `vercel.json` adds the security headers, and `.vercelignore` keeps any stray local `.env` out of CLI uploads.
 
 ## Structure
 
-- `server/index.js` — Express server: POST `/api/terrain` forwards `{command, charX, charY, map}` to Gemini with system prompt in `server/systemPrompt.js`; sanitizes the JSON reply (a single action or an array of them) and falls back to offline parsing on error.
+- `src/ai/terrain.js` — runs in the browser: `requestTerrain` sends `{command, charX, charY, map}` with the system prompt in `src/ai/systemPrompt.js` to the player's chosen provider, then to their other saved providers. It speaks three request shapes (Gemini, Anthropic, OpenAI-compatible), sanitizes the JSON reply (a single action or an array of them) and falls back to offline parsing on error.
+- `src/ai/providers.js` — the provider catalogue (endpoint, default model, key link, per-provider quirks). Adding an OpenAI-compatible provider is one entry here.
+- `src/ai/keys.js` — the bring-your-own-key store: loads/saves/forgets the player's provider choice, keys and models in `localStorage`, degrading to keys-for-this-visit when storage is blocked.
 - `src/game/engine.js` — canvas engine: WASD movement, sprite animation, tile grid, seeded-noise blob growth, Catmull-Rom river carving, zoom, undo stack (10 steps), the wildlife predator–prey sim, and the world's build recipe (`_resolveAction` bakes each AI action down to plain numbers; `_runAction` executes one, live or instantly on replay).
 - `src/game/sharecode.js` — world-code codec: the build recipe as compact tuples, deflated and base64url'd behind a versioned `HYA1.` prefix (`HYA0.` uncompressed where `CompressionStream` is missing). Malformed codes decode to `null` rather than throwing.
-- `src/App.jsx` — command bar, `/` function menu, toast + transient tips, wildlife panel, undo/zoom/share/code controls, and server fetch. The splash→normal GSAP transition measures both ends off the live elements rather than hardcoding pixel targets, so the stylesheet stays the only place responsive geometry is defined.
+- `src/App.jsx` — command bar, `/` function menu, toast + transient tips, wildlife panel, undo/zoom/share/code/key controls, and the 🔑 key panel. The splash→normal GSAP transition measures both ends off the live elements rather than hardcoding pixel targets, so the stylesheet stays the only place responsive geometry is defined.
 - `src/styles.css` — glass UI, with the responsive rules collected in one block at the bottom.
 - `assets/` — character sprites; `assets/nature_pack/` — terrain sprites (tree, acacia, cactus, mountain, snowtree) and animals (`savanna/lion`, `savanna/zebra`, `forest/wolf`, `forest/deer`, `forest/bear`). Any PNG under `nature_pack/**` auto-loads, grouped by name.

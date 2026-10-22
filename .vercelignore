@@ -1,0 +1,6 @@
+# Vercel CLI uploads don't read .gitignore, so list anything that must never
+# leave this machine here too.
+.env
+.env.*
+node_modules
+dist
